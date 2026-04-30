@@ -1,0 +1,94 @@
+import type { MetadataRoute } from "next";
+import { posts, categories } from "@/lib/blog";
+import { SOLUTIONS } from "@/lib/solutions";
+import { SITE_URL } from "@/lib/seo";
+
+type SitemapEntry = MetadataRoute.Sitemap[number];
+
+const STATIC_ROUTES: {
+  path: string;
+  priority: number;
+  changeFrequency: SitemapEntry["changeFrequency"];
+  images?: string[];
+}[] = [
+  { path: "/", priority: 1.0, changeFrequency: "daily", images: ["/opengraph-image", "/icons/plyndrox-512.png"] },
+  { path: "/about", priority: 0.8, changeFrequency: "monthly", images: ["/opengraph-image"] },
+  { path: "/features", priority: 0.9, changeFrequency: "weekly", images: ["/opengraph-image"] },
+  { path: "/pricing", priority: 0.95, changeFrequency: "weekly", images: ["/opengraph-image"] },
+  { path: "/blog", priority: 0.9, changeFrequency: "daily", images: ["/opengraph-image"] },
+  { path: "/contact", priority: 0.7, changeFrequency: "monthly" },
+  { path: "/partners", priority: 0.6, changeFrequency: "monthly" },
+  { path: "/help", priority: 0.6, changeFrequency: "monthly" },
+  // Product / marketing pages
+  { path: "/chat", priority: 0.9, changeFrequency: "weekly", images: ["/opengraph-image"] },
+  { path: "/business-ai", priority: 0.9, changeFrequency: "weekly", images: ["/opengraph-image"] },
+  { path: "/whatsapp-ai", priority: 0.9, changeFrequency: "weekly", images: ["/opengraph-image"] },
+  { path: "/bihar-ai", priority: 0.85, changeFrequency: "weekly", images: ["/opengraph-image"] },
+  { path: "/ibara", priority: 0.85, changeFrequency: "weekly", images: ["/opengraph-image"] },
+  { path: "/inbox", priority: 0.85, changeFrequency: "weekly", images: ["/opengraph-image"] },
+  { path: "/payables", priority: 0.85, changeFrequency: "weekly", images: ["/opengraph-image"] },
+  { path: "/recruit", priority: 0.85, changeFrequency: "weekly", images: ["/opengraph-image"] },
+  { path: "/ledger", priority: 0.8, changeFrequency: "weekly", images: ["/opengraph-image"] },
+  { path: "/translate", priority: 0.7, changeFrequency: "monthly" },
+  // Legal
+  { path: "/privacy-policy", priority: 0.4, changeFrequency: "yearly" },
+  { path: "/terms", priority: 0.4, changeFrequency: "yearly" },
+  { path: "/cookies", priority: 0.4, changeFrequency: "yearly" },
+  { path: "/disclaimer", priority: 0.3, changeFrequency: "yearly" },
+  { path: "/data-deletion", priority: 0.3, changeFrequency: "yearly" },
+];
+
+export default function sitemap(): MetadataRoute.Sitemap {
+  const now = new Date();
+
+  const staticEntries: MetadataRoute.Sitemap = STATIC_ROUTES.map((route) => ({
+    url: `${SITE_URL}${route.path}`,
+    lastModified: now,
+    changeFrequency: route.changeFrequency,
+    priority: route.priority,
+    ...(route.images?.length
+      ? { images: route.images.map((img) => `${SITE_URL}${img}`) }
+      : {}),
+  }));
+
+  const blogEntries: MetadataRoute.Sitemap = posts.map((post) => ({
+    url: `${SITE_URL}/blog/${post.slug}`,
+    lastModified: new Date(post.publishedAt),
+    changeFrequency: "monthly" as const,
+    priority: post.featured ? 0.85 : 0.7,
+    images: [post.image ? `${SITE_URL}${post.image}` : `${SITE_URL}/opengraph-image`],
+  }));
+
+  const categoryEntries: MetadataRoute.Sitemap = categories.map((cat) => ({
+    url: `${SITE_URL}/blog?category=${cat.slug}`,
+    lastModified: now,
+    changeFrequency: "weekly" as const,
+    priority: 0.5,
+  }));
+
+  const solutionsHubEntry: MetadataRoute.Sitemap = [
+    {
+      url: `${SITE_URL}/solutions`,
+      lastModified: now,
+      changeFrequency: "weekly" as const,
+      priority: 0.9,
+      images: [`${SITE_URL}/opengraph-image`],
+    },
+  ];
+
+  const solutionEntries: MetadataRoute.Sitemap = SOLUTIONS.map((s) => ({
+    url: `${SITE_URL}/solutions/${s.slug}`,
+    lastModified: now,
+    changeFrequency: "weekly" as const,
+    priority: 0.75,
+    images: [`${SITE_URL}/opengraph-image`],
+  }));
+
+  return [
+    ...staticEntries,
+    ...solutionsHubEntry,
+    ...solutionEntries,
+    ...blogEntries,
+    ...categoryEntries,
+  ];
+}

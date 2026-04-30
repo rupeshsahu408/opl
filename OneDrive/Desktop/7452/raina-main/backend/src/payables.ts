@@ -1,0 +1,3338 @@
+import express from "express";
+import multer from "multer";
+import mongoose, { Schema } from "mongoose";
+import { createHmac, randomUUID } from "crypto";
+import { google } from "googleapis";
+import { connectMongo } from "./db";
+import { Invoice, InvoiceFlag } from "./models/Invoice";
+import { InboxToken } from "./models/InboxToken";
+import { UserProfile } from "./models/UserProfile";
+import { callNvidiaChatCompletions } from "./ai/nvidiaClient";
+import * as pdfParseModule from "pdf-parse";
+import { buildEmailHtml, buildSubjectLine, EmailSettings, EmailTemplateType } from "./emailTemplates";
+const pdfParse = (pdfParseModule as any).default ?? pdfParseModule;
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const allowed = ["image/jpeg", "image/png", "image/webp", "application/pdf"];
+    cb(null, allowed.includes(file.mimetype));
+  },
+});
+
+export const payablesRouter = express.Router();
+export const payablesPublicRouter = express.Router();
+
+const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY ?? "";
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID ?? "";
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET ?? "";
+const GOOGLE_REDIRECT_URI =
+  process.env.GOOGLE_REDIRECT_URI ?? "https://raina-1.onrender.com/inbox/callback";
+const OAUTH_STATE_SECRET = process.env.OAUTH_STATE_SECRET || GOOGLE_CLIENT_SECRET || "payables-dev-oauth-state";
+const FRONTEND_URL = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_APP_URL || "https://www.plyndrox.app";
+
+const PayablesCompanyProfile =
+  mongoose.models.PayablesCompanyProfile ||
+  mongoose.model(
+    "PayablesCompanyProfile",
+    new Schema(
+      {
+        uid: { type: String, required: true, unique: true, index: true },
+        companyName: { type: String, required: true },
+        industry: String,
+        monthlyInvoices: String,
+        onboarded: { type: Boolean, default: true },
+        gmailAutoImportEnabled: { type: Boolean, default: true },
+        notificationEmail: String,
+        brandName: String,
+        senderDisplayName: String,
+        supportEmail: String,
+        companyAddress: String,
+        paymentTermsDays: { type: Number, default: 30 },
+        defaultCurrency: { type: String, default: "INR" },
+        logoUrl: String,
+        autoEmailOnReceive: { type: Boolean, default: false },
+        autoEmailOnApprove: { type: Boolean, default: true },
+        autoEmailOnReject: { type: Boolean, default: true },
+        autoEmailOnFlag: { type: Boolean, default: false },
+        // Personalization fields
+        logoBase64: String,
+        logoMimeType: String,
+        brandDescription: String,
+        ownerName: String,
+        teamSize: String,
+        gstNumber: String,
+        businessType: String,
+        businessCity: String,
+        websiteUrl: String,
+        preferredPaymentMethod: String,
+        autoApprovalThreshold: Number,
+        fiscalYear: { type: String, default: "april-march" },
+        expenseCategories: [String],
+        vendorCountRange: String,
+        hasInternationalInvoices: { type: Boolean, default: false },
+        preferredLanguage: { type: String, default: "english" },
+        aiTone: { type: String, default: "professional" },
+        alertMode: { type: String, default: "realtime" },
+        financeContactEmail: String,
+        approvalHierarchy: { type: String, default: "flat" },
+        personalizationDone: { type: Boolean, default: false },
+        supplierPortalToken: { type: String, index: true },
+        supplierPortalEnabled: { type: Boolean, default: true },
+      },
+      { timestamps: true }
+    )
+  );
+
+const PayablesSupplierLead =
+  mongoose.models.PayablesSupplierLead ||
+  mongoose.model(
+    "PayablesSupplierLead",
+    new Schema(
+      {
+        uid: { type: String, required: true, index: true },
+        supplierName: String,
+        supplierEmail: String,
+        supplierPhone: String,
+        message: String,
+        sourceToken: String,
+        status: { type: String, default: "new" },
+      },
+      { timestamps: true }
+    )
+  );
+
+const PayablesTeamMember =
+  mongoose.models.PayablesTeamMember ||
+  mongoose.model(
+    "PayablesTeamMember",
+    new Schema(
+      {
+        uid: { type: String, required: true, index: true },
+        email: { type: String, required: true },
+        name: String,
+        role: { type: String, enum: ["owner", "admin", "approver", "member", "viewer"], default: "viewer" },
+        status: { type: String, enum: ["pending", "active", "disabled"], default: "pending" },
+        inviteToken: { type: String, index: true },
+        invitedBy: String,
+        acceptedAt: Date,
+      },
+      { timestamps: true }
+    )
+  );
+
+const PayablesApprovalRule =
+  mongoose.models.PayablesApprovalRule ||
+  mongoose.model(
+    "PayablesApprovalRule",
+    new Schema(
+      {
+        uid: { type: String, required: true, index: true },
+        name: { type: String, required: true },
+        minAmount: { type: Number, default: 0 },
+        maxAmount: Number,
+        currency: String,
+        approverEmail: { type: String, required: true },
+        approverName: String,
+        active: { type: Boolean, default: true },
+      },
+      { timestamps: true }
+    )
+  );
+
+const PayablesAuditLog =
+  mongoose.models.PayablesAuditLog ||
+  mongoose.model(
+    "PayablesAuditLog",
+    new Schema(
+      {
+        uid: { type: String, required: true, index: true },
+        invoiceId: { type: String, index: true },
+        action: { type: String, required: true },
+        actorUid: String,
+        actorEmail: String,
+        details: Schema.Types.Mixed,
+      },
+      { timestamps: true }
+    )
+  );
+
+const PayablesNotification =
+  mongoose.models.PayablesNotification ||
+  mongoose.model(
+    "PayablesNotification",
+    new Schema(
+      {
+        uid: { type: String, required: true, index: true },
+        invoiceId: String,
+        key: { type: String, index: true },
+        type: { type: String, required: true },
+        title: { type: String, required: true },
+        message: { type: String, required: true },
+        severity: { type: String, enum: ["info", "warning", "critical", "success"], default: "info" },
+        readAt: Date,
+      },
+      { timestamps: true }
+    )
+  );
+
+const PayablesAccountingConnection =
+  mongoose.models.PayablesAccountingConnection ||
+  mongoose.model(
+    "PayablesAccountingConnection",
+    new Schema(
+      {
+        uid: { type: String, required: true, index: true },
+        provider: { type: String, enum: ["quickbooks", "xero"], required: true },
+        status: { type: String, enum: ["not_connected", "export_ready", "connected"], default: "not_connected" },
+        externalCompanyName: String,
+        lastSyncAt: Date,
+        lastSyncCount: Number,
+        lastSyncMode: String,
+        settings: Schema.Types.Mixed,
+      },
+      { timestamps: true }
+    )
+  );
+
+function makeOAuth2Client() {
+  return new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
+}
+
+function signOAuthState(payload: Record<string, unknown>) {
+  const body = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const sig = createHmac("sha256", OAUTH_STATE_SECRET).update(body).digest("base64url");
+  return `payables:${body}.${sig}`;
+}
+
+async function getActor(req: express.Request, res: express.Response) {
+  const authUid = (req as any).user?.uid as string | undefined;
+  const authEmail = ((req as any).user?.email as string | undefined)?.toLowerCase();
+  const requestedWorkspace = ((req.headers["x-payables-workspace-uid"] as string | undefined) || (req.headers["x-uid"] as string | undefined) || authUid || "").trim();
+  if (!authUid || !requestedWorkspace) {
+    res.status(401).json({ error: "Unauthorized" });
+    return null;
+  }
+  if (requestedWorkspace === authUid) {
+    return { uid: requestedWorkspace, actorUid: authUid, email: authEmail, role: "owner", memberStatus: "active" };
+  }
+  await connectMongo();
+  const member = await PayablesTeamMember.findOne({ uid: requestedWorkspace, email: authEmail, status: "active" }).lean();
+  if (!member) {
+    res.status(403).json({ error: "You do not have access to this Payables workspace" });
+    return null;
+  }
+  return { uid: requestedWorkspace, actorUid: authUid, email: authEmail, role: (member as any).role ?? "member", memberStatus: (member as any).status ?? "active" };
+}
+
+function canManageWorkspace(actor: { role?: string }) {
+  return ["owner", "admin"].includes(actor.role ?? "");
+}
+
+function canApproveInvoice(actor: { role?: string; email?: string }, invoice: any) {
+  if (["owner", "admin"].includes(actor.role ?? "")) return true;
+  if ((actor.role ?? "") !== "approver") return false;
+  if (!invoice.assignedApproverEmail) return true;
+  return !!actor.email && String(invoice.assignedApproverEmail).toLowerCase() === actor.email.toLowerCase();
+}
+
+function ensureManageWorkspace(actor: { role?: string }, res: express.Response) {
+  if (canManageWorkspace(actor)) return true;
+  res.status(403).json({ error: "Only workspace admins can perform this action" });
+  return false;
+}
+
+function ensureCanApprove(actor: { role?: string; email?: string }, invoice: any, res: express.Response) {
+  if (canApproveInvoice(actor, invoice)) return true;
+  res.status(403).json({ error: "Only an admin or assigned approver can perform this action" });
+  return false;
+}
+
+function makeSupplierPortalToken() {
+  return `sup_${randomUUID().replace(/-/g, "")}`;
+}
+
+function supplierPortalUrl(token: string) {
+  return `${FRONTEND_URL.replace(/\/$/, "")}/payables/supplier/${encodeURIComponent(token)}`;
+}
+
+function sanitizeInvoice(invoice: any) {
+  const obj = typeof invoice?.toObject === "function" ? invoice.toObject() : { ...invoice };
+  obj.hasDocument = !!obj.originalFileData;
+  delete obj.originalFileData;
+  return obj;
+}
+
+async function audit(uid: string, invoiceId: string | undefined, action: string, actor: { uid: string; email?: string }, details?: Record<string, unknown>) {
+  await PayablesAuditLog.create({ uid, invoiceId, action, actorUid: actor.uid, actorEmail: actor.email, details });
+}
+
+function buildSimpleEmail(to: string, subject: string, bodyHtml: string) {
+  return [
+    `To: ${to}`,
+    `Subject: ${subject.replace(/\r?\n/g, " ")}`,
+    "MIME-Version: 1.0",
+    "Content-Type: text/html; charset=UTF-8",
+    "",
+    bodyHtml,
+  ].join("\r\n");
+}
+
+async function sendPayablesEmail(uid: string, input: { to?: string; title: string; message: string; invoiceId?: string }) {
+  try {
+    const [company, profile] = await Promise.all([
+      PayablesCompanyProfile.findOne({ uid }).lean(),
+      UserProfile.findOne({ uid }).lean(),
+    ]);
+    const to = input.to || (company as any)?.notificationEmail || (profile as any)?.email;
+    if (!to) return;
+    const invoiceUrl = input.invoiceId ? `${process.env.FRONTEND_URL ?? "https://www.plyndrox.app"}/payables/invoice/${input.invoiceId}` : `${process.env.FRONTEND_URL ?? "https://www.plyndrox.app"}/payables/dashboard`;
+    const auth = await getGmailClient(uid);
+    const gmail = google.gmail({ version: "v1", auth });
+    const body = `<div style="font-family:Arial,sans-serif;line-height:1.5;color:#1d2226"><h2>${input.title}</h2><p>${input.message}</p><p><a href="${invoiceUrl}" style="display:inline-block;background:#7c3aed;color:#fff;padding:10px 16px;border-radius:999px;text-decoration:none;font-weight:700">Open in Payables AI</a></p></div>`;
+    const raw = Buffer.from(buildSimpleEmail(to, `Payables AI: ${input.title}`, body), "utf8").toString("base64url");
+    await gmail.users.messages.send({ userId: "me", requestBody: { raw } });
+  } catch (err) {
+    console.warn("[payables] email notification skipped:", err instanceof Error ? err.message : err);
+  }
+}
+
+async function sendTeamInviteEmail(uid: string, input: { to: string; inviteeName?: string; role: string; inviterName?: string; inviteUrl: string }) {
+  try {
+    const [company, profile] = await Promise.all([
+      PayablesCompanyProfile.findOne({ uid }).lean(),
+      UserProfile.findOne({ uid }).lean(),
+    ]);
+    const workspaceName = (company as any)?.companyName || (profile as any)?.email || "your team";
+    const inviterDisplay = input.inviterName || (profile as any)?.email || "A workspace admin";
+    const roleLabel = { admin: "Admin", approver: "Approver", viewer: "Viewer", member: "Member" }[input.role] ?? input.role;
+    const body = `<div style="font-family:Arial,sans-serif;line-height:1.6;color:#1d2226;max-width:560px;margin:0 auto">
+      <div style="background:linear-gradient(135deg,#7c3aed,#4f46e5);border-radius:16px 16px 0 0;padding:32px 32px 24px">
+        <h1 style="margin:0;color:#fff;font-size:22px;font-weight:800">You&rsquo;re invited to join ${workspaceName}</h1>
+      </div>
+      <div style="background:#fff;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 16px 16px;padding:32px">
+        <p style="margin:0 0 16px;font-size:15px">Hi${input.inviteeName ? ` ${input.inviteeName}` : ""},</p>
+        <p style="margin:0 0 24px;font-size:15px"><strong>${inviterDisplay}</strong> has invited you to collaborate on <strong>${workspaceName}</strong> in Payables AI as an <strong>${roleLabel}</strong>.</p>
+        <p style="margin:0 0 24px;font-size:14px;color:#6b7280">As ${roleLabel === "Approver" ? "an Approver" : `a${["Admin","Approver"].includes(roleLabel) ? "n" : ""} ${roleLabel}`}, you will be able to ${roleLabel === "Admin" ? "manage the workspace, invite members, and handle invoices" : roleLabel === "Approver" ? "review and approve invoices assigned to you" : roleLabel === "Viewer" ? "view invoices and reports in read-only mode" : "view and submit invoices"}.</p>
+        <a href="${input.inviteUrl}" style="display:inline-block;background:linear-gradient(135deg,#7c3aed,#4f46e5);color:#fff;padding:14px 28px;border-radius:999px;text-decoration:none;font-weight:700;font-size:15px">Accept Invitation</a>
+        <p style="margin:28px 0 0;font-size:12px;color:#9ca3af">Or copy this link into your browser:<br><span style="word-break:break-all;color:#7c3aed">${input.inviteUrl}</span></p>
+        <p style="margin:20px 0 0;font-size:12px;color:#9ca3af">This invitation is specific to ${input.to}. If you received this by mistake, you can safely ignore it.</p>
+      </div>
+    </div>`;
+    const auth = await getGmailClient(uid);
+    const gmail = google.gmail({ version: "v1", auth });
+    const raw = Buffer.from(buildSimpleEmail(input.to, `You're invited to join ${workspaceName} on Payables AI`, body), "utf8").toString("base64url");
+    await gmail.users.messages.send({ userId: "me", requestBody: { raw } });
+    console.log(`[payables] team invite email sent to ${input.to}`);
+  } catch (err) {
+    console.warn("[payables] team invite email skipped:", err instanceof Error ? err.message : err);
+  }
+}
+
+async function getEmailSettings(uid: string): Promise<EmailSettings> {
+  await connectMongo();
+  const company = (await PayablesCompanyProfile.findOne({ uid }).lean()) as any;
+  const profile = (await UserProfile.findOne({ uid }).lean()) as any;
+  return {
+    brandName: company?.brandName || company?.companyName || "Your Company",
+    senderDisplayName: company?.senderDisplayName || `${company?.companyName ?? "AP"} Automation System`,
+    supportEmail: company?.supportEmail || company?.notificationEmail || profile?.email || "ap@example.com",
+    companyAddress: company?.companyAddress || "",
+    paymentTermsDays: company?.paymentTermsDays ?? 30,
+    defaultCurrency: company?.defaultCurrency || "INR",
+    logoUrl: company?.logoUrl,
+  };
+}
+
+async function sendSupplierEmail(
+  uid: string,
+  invoice: any,
+  type: EmailTemplateType,
+  opts: { to?: string; sentBy?: string } = {}
+): Promise<{ success: boolean; to?: string; subject?: string; error?: string }> {
+  try {
+    const to = opts.to || invoice.vendorEmail;
+    if (!to) return { success: false, error: "No supplier email address found on this invoice." };
+
+    const settings = await getEmailSettings(uid);
+    const invData = {
+      invoiceNumber: invoice.invoiceNumber,
+      invoiceDate: invoice.invoiceDate,
+      dueDate: invoice.dueDate,
+      total: invoice.total,
+      currency: invoice.currency,
+      vendor: invoice.vendor,
+      vendorEmail: invoice.vendorEmail,
+      subtotal: invoice.subtotal,
+      tax: invoice.tax,
+      discount: invoice.discount,
+      rejectionReason: invoice.rejectionReason,
+      flagMessages: (invoice.flags ?? []).map((f: any) => f.message).filter(Boolean),
+      bankDetails: invoice.bankDetails,
+      paidAt: invoice.paidAt ? invoice.paidAt.toISOString() : undefined,
+      paidNote: invoice.paidNote,
+    };
+
+    const subject = buildSubjectLine(type, invData, settings);
+    const html = buildEmailHtml(type, invData, settings);
+    const auth = await getGmailClient(uid);
+    const gmail = google.gmail({ version: "v1", auth });
+    const raw = Buffer.from(buildSimpleEmail(to, subject, html), "utf8").toString("base64url");
+    await gmail.users.messages.send({ userId: "me", requestBody: { raw } });
+
+    await Invoice.findByIdAndUpdate(invoice._id, {
+      $push: {
+        emailLog: {
+          type,
+          to,
+          subject,
+          sentAt: new Date(),
+          sentBy: opts.sentBy ?? "system",
+          previewHtml: html,
+        },
+      },
+    });
+
+    return { success: true, to, subject };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[payables] sendSupplierEmail (${type}) failed:`, msg);
+    return { success: false, error: msg };
+  }
+}
+
+async function notify(uid: string, input: { invoiceId?: string; key: string; type: string; title: string; message: string; severity?: string; emailTo?: string }) {
+  const existing = await PayablesNotification.findOne({ uid, key: input.key }).lean();
+  if (existing) return;
+  await PayablesNotification.create({ uid, ...input });
+  await sendPayablesEmail(uid, { to: input.emailTo, title: input.title, message: input.message, invoiceId: input.invoiceId });
+}
+
+async function getGmailClient(uid: string) {
+  await connectMongo();
+  const record = await InboxToken.findOne({ uid });
+  if (!record) throw new Error("No Gmail connection found.");
+  const oauth2 = makeOAuth2Client();
+  oauth2.setCredentials({
+    access_token: record.accessToken,
+    refresh_token: record.refreshToken,
+    expiry_date: record.expiresAt,
+  });
+  const { credentials } = await oauth2.refreshAccessToken();
+  if (credentials.access_token && credentials.access_token !== record.accessToken) {
+    record.accessToken = credentials.access_token;
+    if (credentials.expiry_date) record.expiresAt = credentials.expiry_date;
+    await record.save();
+  }
+  oauth2.setCredentials(credentials);
+  return oauth2;
+}
+
+const INVOICE_EXTRACTION_PROMPT = `You are an expert accounts payable AI. Extract all invoice data from this document and return ONLY a valid JSON object with these exact fields (use null for missing fields):
+{
+  "vendor": "string — the SUPPLIER/SELLER company name (the one who issued this invoice and is receiving payment). This is usually at the TOP of the invoice, in a header or 'From:' section.",
+  "vendorEmail": "string — supplier/seller email address",
+  "vendorAddress": "string — supplier/seller full address",
+  "supplierGstin": "string — GSTIN of the supplier/seller (e.g. 27AABCT1332L1ZN)",
+  "buyerName": "string — the BUYER/CLIENT company name in the 'Bill To' or 'Billed To' section. This is the company PAYING the invoice, NOT the vendor.",
+  "buyerEmail": "string — buyer email if present",
+  "buyerAddress": "string — buyer full address",
+  "buyerGstin": "string — GSTIN of the buyer (e.g. 09AABCI2231K1ZP)",
+  "invoiceNumber": "string — invoice number, may be labelled Invoice No., Invoice #, Inv No., Bill No., etc.",
+  "poNumber": "string — Purchase Order number, may be labelled PO No., PO Number, Purchase Order, etc.",
+  "invoiceDate": "string — ISO date YYYY-MM-DD",
+  "dueDate": "string — ISO date YYYY-MM-DD",
+  "currency": "string — 3-letter ISO code like USD, INR, EUR",
+  "subtotal": number,
+  "tax": number,
+  "discount": number,
+  "total": number,
+  "lineItems": [
+    {
+      "description": "string",
+      "hsnCode": "string — HSN/SAC code for this line item",
+      "quantity": number,
+      "unitPrice": number,
+      "gstPercent": number,
+      "amount": number
+    }
+  ],
+  "notes": "string — payment terms, conditions, or any notes",
+  "bankDetails": {
+    "bankName": "string",
+    "accountNumber": "string",
+    "ifscCode": "string",
+    "accountHolderName": "string",
+    "accountType": "string"
+  },
+  "confidence": number between 0 and 1
+}
+CRITICAL RULES — Vendor vs Buyer:
+- The VENDOR (supplier) is the company that SENT the invoice and is RECEIVING payment. It is usually displayed prominently at the TOP of the invoice with a logo, address, and GSTIN.
+- The BUYER (client) is the company that RECEIVES the invoice and MAKES payment. It appears in the "Bill To" / "Billed To" section.
+- NEVER put the "Bill To" company name in the vendor field. They are always different companies.
+- Example: If the invoice header says "TechSupply Co." and "Bill To: InvoFlow Technologies Pvt. Ltd.", then vendor="TechSupply Co." and buyerName="InvoFlow Technologies Pvt. Ltd."
+Currency rules:
+- Return ISO 4217 codes only.
+- Use INR for ₹, Rs, Rs., INR, rupee, rupees, or amounts labelled "(Rs.)".
+- Use USD for $, US$, dollar, dollars; EUR for €, euro; GBP for £, pound; AED for dirham; SGD for S$; AUD/CAD only when explicitly shown.
+- Never default to USD. If the document does not show a currency, return null.
+Amount rules:
+- Return numeric values only — remove currency symbols and commas including Indian grouping (e.g. 1,74,500.00 → 174500).
+- Prefer "Total Due", "Grand Total", or "Amount Due" for the total field.
+- GST/IGST/CGST/SGST amounts should be summed into the tax field.
+- Extract GST % per line item into gstPercent as a number (e.g. 18% → 18).
+Return ONLY the JSON object. No markdown, no code blocks, no explanation.`;
+
+function extractJsonFromResponse(response: string): Record<string, unknown> | null {
+  const cleaned = response.trim();
+  const match = cleaned.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try {
+    return JSON.parse(match[0]);
+  } catch {
+    const repaired = match[0]
+      .replace(/,\s*\}/g, "}")
+      .replace(/,\s*\]/g, "]")
+      .replace(/([{,]\s*)(\w+)(\s*:)/g, '$1"$2"$3');
+    try {
+      return JSON.parse(repaired);
+    } catch {
+      return null;
+    }
+  }
+}
+
+async function extractInvoiceDataFromImage(imageBase64: string, mimeType: string): Promise<Record<string, unknown>> {
+  try {
+    if (mimeType === "application/pdf") {
+      const pdfBuffer = Buffer.from(imageBase64, "base64");
+      let pdfText = "";
+      try {
+        const pdfData = await pdfParse(pdfBuffer);
+        pdfText = pdfData.text?.trim() ?? "";
+      } catch (pdfErr) {
+        console.warn("[payables] pdf-parse failed:", pdfErr instanceof Error ? pdfErr.message : pdfErr);
+      }
+      if (!pdfText || pdfText.length < 30) {
+        console.warn("[payables] PDF text extraction returned insufficient text, falling back to base64 text approach");
+        pdfText = "";
+      }
+      const content = pdfText
+        ? `${INVOICE_EXTRACTION_PROMPT}\n\nINVOICE TEXT CONTENT:\n${pdfText.slice(0, 6000)}`
+        : `${INVOICE_EXTRACTION_PROMPT}\n\n[This PDF could not be parsed as text. Do your best to extract invoice fields from context.]`;
+      const response = await callNvidiaChatCompletions({
+        apiKey: NVIDIA_API_KEY,
+        model: "nvidia/llama-3.1-nemotron-70b-instruct",
+        messages: [{ role: "user", content }],
+        temperature: 0.1,
+        max_tokens: 2000,
+      });
+      const parsed = extractJsonFromResponse(response);
+      if (!parsed) return {};
+      return normalizeExtractedData(parsed, `${response}\n${pdfText}`);
+    }
+
+    const response = await callNvidiaChatCompletions({
+      apiKey: NVIDIA_API_KEY,
+      model: "meta/llama-3.2-90b-vision-instruct",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: INVOICE_EXTRACTION_PROMPT },
+          { type: "image_url", image_url: { url: `data:${mimeType};base64,${imageBase64}` } },
+        ],
+      }],
+      temperature: 0.1,
+      max_tokens: 2000,
+    });
+    const parsed = extractJsonFromResponse(response);
+    if (!parsed) return {};
+    return normalizeExtractedData(parsed, response);
+  } catch (err) {
+    console.error("[payables] extractInvoiceDataFromImage error:", err instanceof Error ? err.message : err);
+    return {};
+  }
+}
+
+async function extractInvoiceDataFromText(text: string): Promise<Record<string, unknown>> {
+  try {
+    const response = await callNvidiaChatCompletions({
+      apiKey: NVIDIA_API_KEY,
+      model: "nvidia/llama-3.1-nemotron-70b-instruct",
+      messages: [
+        {
+          role: "user",
+          content: `${INVOICE_EXTRACTION_PROMPT}\n\nEMAIL/TEXT TO EXTRACT FROM:\n${text.slice(0, 6000)}`,
+        },
+      ],
+      temperature: 0.1,
+      max_tokens: 2000,
+    });
+    const parsed = extractJsonFromResponse(response);
+    if (!parsed) return {};
+    return normalizeExtractedData(parsed, `${response}\n${text}`);
+  } catch (err) {
+    console.error("[payables] extractInvoiceDataFromText error:", err instanceof Error ? err.message : err);
+    return {};
+  }
+}
+
+function parseAmount(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string") return undefined;
+  const cleaned = value.replace(/[^\d.-]/g, "");
+  if (!cleaned || cleaned === "-" || cleaned === ".") return undefined;
+  const parsed = Number(cleaned);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function normalizeCurrency(value: unknown, context = "") {
+  const raw = String(value ?? "").trim();
+  const text = `${raw} ${context}`.toLowerCase();
+  const upper = raw.toUpperCase();
+  const validCodes = new Set(["INR", "USD", "EUR", "GBP", "AED", "SGD", "AUD", "CAD", "JPY", "CNY"]);
+  if (validCodes.has(upper)) return upper;
+  if (/[₹]|(?:^|[^a-z])rs\.?(?:[^a-z]|$)|\binr\b|\brupees?\b|\bamount\s*\(rs\.?\)/i.test(text)) return "INR";
+  if (/€|\beur\b|\beuros?\b/i.test(text)) return "EUR";
+  if (/£|\bgbp\b|\bpounds?\b/i.test(text)) return "GBP";
+  if (/\baed\b|\bdirhams?\b/i.test(text)) return "AED";
+  if (/\bsgd\b|s\$/i.test(text)) return "SGD";
+  if (/\baud\b/i.test(text)) return "AUD";
+  if (/\bcad\b/i.test(text)) return "CAD";
+  if (/\busd\b|us\$|\$\s*\d|\bdollars?\b/i.test(text)) return "USD";
+  return undefined;
+}
+
+function normalizeDateValue(value: unknown) {
+  if (!value) return undefined;
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed;
+  const parsed = new Date(trimmed);
+  if (Number.isNaN(parsed.getTime())) return trimmed;
+  return parsed.toISOString().slice(0, 10);
+}
+
+function normalizeExtractedData(data: Record<string, unknown>, context = "") {
+  const normalized: Record<string, unknown> = { ...data };
+  const combinedContext = `${context}\n${JSON.stringify(data)}`;
+  const currency = normalizeCurrency(data.currency, combinedContext);
+  if (currency) normalized.currency = currency;
+  else delete normalized.currency;
+  for (const key of ["subtotal", "tax", "total", "discount"]) {
+    const amount = parseAmount(data[key]);
+    if (amount !== undefined) normalized[key] = amount;
+  }
+  normalized.invoiceDate = normalizeDateValue(data.invoiceDate);
+  normalized.dueDate = normalizeDateValue(data.dueDate);
+  if (Array.isArray(data.lineItems)) {
+    normalized.lineItems = data.lineItems.map((item) => {
+      const row = typeof item === "object" && item !== null ? item as Record<string, unknown> : {};
+      const gstPct = parseAmount(row.gstPercent);
+      return {
+        description: String(row.description ?? "").trim(),
+        hsnCode: row.hsnCode ? String(row.hsnCode).trim() : undefined,
+        quantity: parseAmount(row.quantity),
+        unitPrice: parseAmount(row.unitPrice),
+        gstPercent: gstPct !== undefined ? Math.max(0, Math.min(100, gstPct)) : undefined,
+        amount: parseAmount(row.amount),
+      };
+    }).filter((item) => item.description || item.amount !== undefined);
+  }
+  if (data.bankDetails && typeof data.bankDetails === "object") {
+    const bd = data.bankDetails as Record<string, unknown>;
+    normalized.bankDetails = {
+      bankName: bd.bankName ? String(bd.bankName).trim() : undefined,
+      accountNumber: bd.accountNumber ? String(bd.accountNumber).trim() : undefined,
+      ifscCode: bd.ifscCode ? String(bd.ifscCode).trim().toUpperCase() : undefined,
+      accountHolderName: bd.accountHolderName ? String(bd.accountHolderName).trim() : undefined,
+      accountType: bd.accountType ? String(bd.accountType).trim() : undefined,
+    };
+  }
+  const confidence = parseAmount(data.confidence);
+  if (confidence !== undefined) normalized.confidence = Math.max(0, Math.min(1, confidence > 1 ? confidence / 100 : confidence));
+  return normalized;
+}
+
+function applyExtracted(invoice: InstanceType<typeof Invoice>, data: Record<string, unknown>) {
+  data = normalizeExtractedData(data);
+  if (data.vendor) (invoice as any).vendor = data.vendor;
+  if (data.vendorEmail) (invoice as any).vendorEmail = data.vendorEmail;
+  if (data.vendorAddress) (invoice as any).vendorAddress = data.vendorAddress;
+  if (data.supplierGstin) (invoice as any).supplierGstin = data.supplierGstin;
+  if (data.buyerName) (invoice as any).buyerName = data.buyerName;
+  if (data.buyerEmail) (invoice as any).buyerEmail = data.buyerEmail;
+  if (data.buyerAddress) (invoice as any).buyerAddress = data.buyerAddress;
+  if (data.buyerGstin) (invoice as any).buyerGstin = data.buyerGstin;
+  if (data.invoiceNumber) (invoice as any).invoiceNumber = data.invoiceNumber;
+  if (data.poNumber) (invoice as any).poNumber = data.poNumber;
+  if (data.invoiceDate) (invoice as any).invoiceDate = data.invoiceDate;
+  if (data.dueDate) (invoice as any).dueDate = data.dueDate;
+  if (data.currency) (invoice as any).currency = data.currency;
+  if (typeof data.subtotal === "number") (invoice as any).subtotal = data.subtotal;
+  if (typeof data.tax === "number") (invoice as any).tax = data.tax;
+  if (typeof data.total === "number") (invoice as any).total = data.total;
+  if (typeof data.discount === "number") (invoice as any).discount = data.discount;
+  if (Array.isArray(data.lineItems)) (invoice as any).lineItems = data.lineItems;
+  if (data.notes) (invoice as any).notes = data.notes;
+  if (data.bankDetails && typeof data.bankDetails === "object") (invoice as any).bankDetails = data.bankDetails;
+  if (typeof data.confidence === "number") (invoice as any).confidence = data.confidence;
+}
+
+async function extractAndApplyInvoice(invoice: any) {
+  let extracted: Record<string, unknown> = {};
+  if (invoice.originalFileData && invoice.originalMimeType) {
+    extracted = await extractInvoiceDataFromImage(invoice.originalFileData, invoice.originalMimeType);
+  } else if (invoice.rawText) {
+    extracted = await extractInvoiceDataFromText(invoice.rawText);
+  }
+  applyExtracted(invoice, extracted);
+  invoice.status = "extracted";
+  await invoice.save();
+  return extracted;
+}
+
+async function applyApprovalRules(invoice: any, uid: string) {
+  if (!invoice.total) return;
+  const rules = await PayablesApprovalRule.find({ uid, active: true }).sort({ minAmount: -1 }).lean();
+  const rule = rules.find((r: any) => {
+    if (r.currency && invoice.currency && r.currency !== invoice.currency) return false;
+    if (invoice.total < (r.minAmount ?? 0)) return false;
+    if (typeof r.maxAmount === "number" && invoice.total > r.maxAmount) return false;
+    return true;
+  }) as any;
+  if (!rule) return;
+  invoice.approvalRuleId = rule._id.toString();
+  invoice.approvalRuleName = rule.name;
+  invoice.assignedApproverEmail = rule.approverEmail;
+  invoice.assignedApproverName = rule.approverName;
+  await notify(uid, {
+    invoiceId: invoice._id.toString(),
+    key: `assigned:${invoice._id.toString()}:${rule._id.toString()}`,
+    type: "approval_assignment",
+    title: "Invoice assigned for approval",
+    message: `${invoice.vendor ?? "An invoice"} for ${invoice.currency ?? ""}${invoice.total?.toLocaleString?.() ?? invoice.total} matched rule ${rule.name} and was assigned to ${rule.approverEmail}.`,
+    severity: "info",
+    emailTo: rule.approverEmail,
+  });
+}
+
+async function analyzeInvoice(invoiceId: string, uid: string): Promise<void> {
+  try {
+    await connectMongo();
+    const invoice = (await Invoice.findOne({ _id: invoiceId, uid })) as any;
+    if (!invoice) return;
+
+    const flags: InvoiceFlag[] = [];
+    const missing: string[] = [];
+    if (!invoice.vendor) missing.push("vendor name");
+    if (!invoice.total) missing.push("total amount");
+    if (!invoice.invoiceNumber) missing.push("invoice number");
+    if (missing.length > 0) {
+      flags.push({
+        type: "missing_fields",
+        severity: missing.includes("total amount") ? "warning" : "info",
+        message: `Could not extract: ${missing.join(", ")}. Please review and fill in manually.`,
+      });
+    }
+
+    if (invoice.vendor && invoice.invoiceNumber) {
+      const duplicate = await Invoice.findOne({ uid, vendor: invoice.vendor, invoiceNumber: invoice.invoiceNumber, _id: { $ne: invoice._id } }).lean();
+      if (duplicate) {
+        flags.push({
+          type: "duplicate",
+          severity: "critical",
+          message: `Possible duplicate: An invoice from "${invoice.vendor}" with number #${invoice.invoiceNumber} already exists. Please verify before approving.`,
+          relatedInvoiceId: (duplicate as any)._id.toString(),
+        });
+      }
+    }
+
+    if (invoice.vendor) {
+      const previousCount = await Invoice.countDocuments({ uid, vendor: invoice.vendor, _id: { $ne: invoice._id } });
+      if (previousCount === 0) {
+        invoice.isNewVendor = true;
+      } else {
+        invoice.isNewVendor = false;
+      }
+
+      if (invoice.total && previousCount >= 2) {
+        const vendorStats = await Invoice.aggregate([
+          { $match: { uid, vendor: invoice.vendor, _id: { $ne: invoice._id }, total: { $exists: true, $gt: 0 } } },
+          { $group: { _id: null, avgTotal: { $avg: "$total" }, maxTotal: { $max: "$total" }, count: { $sum: 1 } } },
+        ]);
+        if (vendorStats.length > 0) {
+          const { avgTotal, maxTotal } = vendorStats[0];
+          const threshold = Math.max(avgTotal * 2.5, maxTotal * 1.5);
+          if (invoice.total > threshold) {
+            const pctOver = Math.round(((invoice.total - avgTotal) / avgTotal) * 100);
+            flags.push({
+              type: "amount_anomaly",
+              severity: "warning",
+              message: `This invoice total (${invoice.currency ?? ""}${invoice.total.toLocaleString()}) is ${pctOver}% higher than the average for "${invoice.vendor}" (avg: ${invoice.currency ?? ""}${Math.round(avgTotal).toLocaleString()}). Verify before approving.`,
+            });
+          }
+        }
+      }
+
+      if (invoice.dueDate && !["approved", "rejected", "paid"].includes(invoice.status)) {
+        const daysUntil = Math.ceil((new Date(invoice.dueDate).getTime() - Date.now()) / 86400000);
+        if (daysUntil <= 3 && daysUntil >= 0) {
+          flags.push({
+            type: "overdue_risk",
+            severity: daysUntil === 0 ? "critical" : "warning",
+            message: daysUntil === 0 ? "This invoice is due today! Approve and process payment immediately." : `This invoice is due in ${daysUntil} day${daysUntil !== 1 ? "s" : ""}. Approve it soon to avoid late payment.`,
+          });
+        } else if (daysUntil < 0) {
+          flags.push({
+            type: "overdue_risk",
+            severity: "critical",
+            message: `This invoice was due ${Math.abs(daysUntil)} day${Math.abs(daysUntil) !== 1 ? "s" : ""} ago and has not been paid. Take action immediately.`,
+          });
+        }
+      }
+    }
+
+    invoice.flags = flags;
+    invoice.analysedAt = new Date();
+    if (invoice.status === "extracted") {
+      const hasCritical = flags.some((f) => f.severity === "critical");
+      invoice.status = hasCritical ? "extracted" : "pending_approval";
+    }
+    await applyApprovalRules(invoice, uid);
+    await invoice.save();
+
+    for (const flag of flags.filter((f) => f.severity !== "info")) {
+      await notify(uid, {
+        invoiceId,
+        key: `flag:${invoiceId}:${flag.type}`,
+        type: "invoice_flag",
+        title: flag.severity === "critical" ? "Critical invoice issue" : "Invoice needs review",
+        message: flag.message,
+        severity: flag.severity,
+      });
+    }
+  } catch (err) {
+    console.error("[payables] analyzeInvoice error:", err);
+  }
+}
+
+function decodeGmailData(data?: string | null) {
+  if (!data) return "";
+  return Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8");
+}
+
+function collectParts(payload: any, parts: any[] = []) {
+  if (!payload) return parts;
+  parts.push(payload);
+  for (const p of payload.parts ?? []) collectParts(p, parts);
+  return parts;
+}
+
+function invoiceAmount(invoice: any) {
+  return Number(invoice.total ?? invoice.paymentAmount ?? 0) || 0;
+}
+
+function daysFromNow(date?: string | Date) {
+  if (!date) return null;
+  return Math.ceil((new Date(date).getTime() - Date.now()) / 86400000);
+}
+
+function paymentUrgency(invoice: any) {
+  const days = daysFromNow(invoice.dueDate);
+  if (days == null) return "unscheduled";
+  if (days < 0) return "overdue";
+  if (days <= 3) return "due_soon";
+  if (days <= 14) return "upcoming";
+  return "later";
+}
+
+function earlyPaymentDiscount(invoice: any) {
+  const text = [invoice.notes, invoice.rawText].filter(Boolean).join(" ").toLowerCase();
+  const amount = invoiceAmount(invoice);
+  const match = text.match(/(\d+(?:\.\d+)?)\s*%[^.]{0,40}(?:early|within|days|net)/i) || text.match(/(\d+(?:\.\d+)?)\s*\/\s*10/);
+  if (!match || !amount) return null;
+  const percent = Math.min(Number(match[1]), 50);
+  if (!percent) return null;
+  const estimatedSavings = Math.round((amount * percent) / 100);
+  return { percent, estimatedSavings, message: "Possible " + percent + "% early-payment discount detected. Estimated savings: " + (invoice.currency ?? "USD") + " " + estimatedSavings.toLocaleString() + "." };
+}
+
+function startOfDay(date = new Date()) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function addDays(date: Date, days: number) {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function summarizeInvoices(invoices: any[]) {
+  return invoices.reduce((sum, inv) => sum + invoiceAmount(inv), 0);
+}
+
+function csvEscape(value: unknown) {
+  const str = String(value ?? "");
+  return /[",\n]/.test(str) ? '"' + str.replace(/"/g, '""') + '"' : str;
+}
+
+function xmlEscape(value: unknown) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function accountingAmount(value: unknown) {
+  const num = Number(value ?? 0);
+  return Number.isFinite(num) ? Number(num.toFixed(2)) : 0;
+}
+
+function invoiceExportRows(invoices: any[]) {
+  return invoices.map((inv) => {
+    const total = accountingAmount(inv.total);
+    const tax = accountingAmount(inv.tax);
+    const subtotal = accountingAmount(inv.subtotal ?? Math.max(total - tax, 0));
+    return {
+      invoiceNumber: inv.invoiceNumber ?? "",
+      vendor: inv.vendor ?? "Unknown Vendor",
+      vendorEmail: inv.vendorEmail ?? "",
+      supplierGstin: inv.supplierGstin ?? "",
+      vendorAddress: inv.vendorAddress ?? "",
+      buyerName: inv.buyerName ?? "",
+      buyerGstin: inv.buyerGstin ?? "",
+      invoiceDate: inv.invoiceDate ?? "",
+      dueDate: inv.dueDate ?? "",
+      status: inv.status ?? "",
+      currency: inv.currency ?? "INR",
+      subtotal,
+      tax,
+      discount: accountingAmount(inv.discount),
+      total,
+      poNumber: inv.poNumber ?? "",
+      bankName: inv.bankDetails?.bankName ?? "",
+      accountNumber: inv.bankDetails?.accountNumber ?? "",
+      ifscCode: inv.bankDetails?.ifscCode ?? "",
+      hsnCodes: (inv.lineItems ?? []).map((item: any) => item.hsnCode).filter(Boolean).join("; "),
+      lineItems: (inv.lineItems ?? []).map((item: any) => `${item.description ?? "Item"} ${item.quantity ?? ""} ${item.amount ?? ""}`.trim()).join("; "),
+      source: inv.source ?? "",
+      createdAt: inv.createdAt ? new Date(inv.createdAt).toLocaleDateString("en-IN") : "",
+    };
+  });
+}
+
+function sendCsv(res: express.Response, filename: string, headers: string[], rows: unknown[][]) {
+  const csv = "\ufeff" + [headers.map(csvEscape).join(","), ...rows.map((row) => row.map(csvEscape).join(","))].join("\n");
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  res.send(csv);
+}
+
+payablesPublicRouter.get("/supplier-portal/:token", async (req, res) => {
+  try {
+    await connectMongo();
+    const company = await PayablesCompanyProfile.findOne({
+      supplierPortalToken: req.params.token,
+      supplierPortalEnabled: { $ne: false },
+    }).lean() as any;
+    if (!company) return res.status(404).json({ error: "Supplier upload link not found" });
+    res.json({
+      companyName: company.companyName ?? "",
+      brandName: company.brandName ?? company.companyName ?? "",
+      brandDescription: company.brandDescription ?? "",
+      logoBase64: company.logoBase64 ?? "",
+      logoMimeType: company.logoMimeType ?? "",
+      companyAddress: company.companyAddress ?? "",
+      gstNumber: company.gstNumber ?? "",
+      websiteUrl: company.websiteUrl ?? "",
+      supportEmail: company.supportEmail ?? company.financeContactEmail ?? company.notificationEmail ?? "",
+      businessCity: company.businessCity ?? "",
+      businessType: company.businessType ?? "",
+    });
+  } catch (err) {
+    console.error("Supplier portal fetch error:", err);
+    res.status(500).json({ error: "Failed to load supplier upload page" });
+  }
+});
+
+payablesPublicRouter.post("/supplier-portal/:token/upload", upload.single("invoice"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No file provided" });
+    await connectMongo();
+    const company = await PayablesCompanyProfile.findOne({
+      supplierPortalToken: req.params.token,
+      supplierPortalEnabled: { $ne: false },
+    }).lean() as any;
+    if (!company) return res.status(404).json({ error: "Supplier upload link not found" });
+    const supplierName = String(req.body.supplierName ?? "").trim();
+    const supplierEmail = String(req.body.supplierEmail ?? "").trim().toLowerCase();
+    const invoice = new Invoice({
+      uid: company.uid,
+      source: "supplier_link",
+      status: "processing",
+      vendor: supplierName || undefined,
+      vendorEmail: supplierEmail || undefined,
+      originalFileName: req.file.originalname,
+      originalMimeType: req.file.mimetype,
+      originalFileData: req.file.buffer.toString("base64"),
+      notes: supplierName || supplierEmail ? `Submitted by supplier portal${supplierName ? `: ${supplierName}` : ""}${supplierEmail ? ` <${supplierEmail}>` : ""}` : "Submitted by supplier portal",
+    }) as any;
+    await invoice.save();
+    await audit(company.uid, invoice._id.toString(), "supplier_invoice_uploaded", { uid: "supplier-link", email: supplierEmail || undefined }, { fileName: req.file.originalname, supplierName, supplierEmail });
+    await notify(company.uid, {
+      invoiceId: invoice._id.toString(),
+      key: `supplier:${invoice._id.toString()}`,
+      type: "new_supplier_invoice",
+      title: "Supplier uploaded an invoice",
+      message: `${supplierName || "A supplier"} uploaded ${req.file.originalname}. AI extraction has started.`,
+      severity: "info",
+    });
+    setImmediate(async () => {
+      try {
+        await extractAndApplyInvoice(invoice);
+        await analyzeInvoice(invoice._id.toString(), company.uid);
+      } catch (err) {
+        console.error("Supplier invoice processing error:", err);
+        invoice.status = "extracted";
+        await invoice.save();
+      }
+    });
+    res.json({ success: true, invoiceId: invoice._id.toString() });
+  } catch (err) {
+    console.error("Supplier portal upload error:", err);
+    res.status(500).json({ error: "Upload failed" });
+  }
+});
+
+payablesPublicRouter.post("/supplier-portal/:token/interest", async (req, res) => {
+  try {
+    await connectMongo();
+    const company = await PayablesCompanyProfile.findOne({
+      supplierPortalToken: req.params.token,
+      supplierPortalEnabled: { $ne: false },
+    }).lean() as any;
+    if (!company) return res.status(404).json({ error: "Supplier upload link not found" });
+    const supplierName = String(req.body.supplierName ?? "").trim();
+    const supplierEmail = String(req.body.supplierEmail ?? "").trim().toLowerCase();
+    const supplierPhone = String(req.body.supplierPhone ?? "").trim();
+    const message = String(req.body.message ?? "").trim();
+    if (!supplierName && !supplierEmail && !supplierPhone) return res.status(400).json({ error: "Please share at least one contact detail" });
+    await PayablesSupplierLead.create({ uid: company.uid, supplierName, supplierEmail, supplierPhone, message, sourceToken: req.params.token });
+    await notify(company.uid, {
+      key: `supplier-lead:${req.params.token}:${Date.now()}`,
+      type: "supplier_interest",
+      title: "Supplier wants to connect",
+      message: `${supplierName || supplierEmail || supplierPhone} submitted interest from your supplier upload page.`,
+      severity: "success",
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Supplier interest error:", err);
+    res.status(500).json({ error: "Failed to submit interest" });
+  }
+});
+
+payablesRouter.get("/company", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const profile = await PayablesCompanyProfile.findOne({ uid: actor.uid }).lean() as any;
+    res.json(profile ? {
+      ...profile,
+      supplierPortalUrl: profile.supplierPortalToken ? supplierPortalUrl(profile.supplierPortalToken) : "",
+    } : { uid: actor.uid, onboarded: false, companyName: "", industry: "", monthlyInvoices: "", gmailAutoImportEnabled: true, supplierPortalUrl: "" });
+  } catch {
+    res.status(500).json({ error: "Failed to fetch company profile" });
+  }
+});
+
+payablesRouter.get("/supplier-link", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  try {
+    await connectMongo();
+    let company = await PayablesCompanyProfile.findOne({ uid: actor.uid }) as any;
+    if (!company) return res.status(404).json({ error: "Complete Payables onboarding before creating a supplier link." });
+    if (!company.supplierPortalToken) {
+      company.supplierPortalToken = makeSupplierPortalToken();
+      company.supplierPortalEnabled = true;
+      await company.save();
+      await audit(actor.uid, undefined, "supplier_portal_link_created", actor, { supplierPortalToken: company.supplierPortalToken });
+    }
+    res.json({
+      token: company.supplierPortalToken,
+      url: supplierPortalUrl(company.supplierPortalToken),
+      enabled: company.supplierPortalEnabled !== false,
+    });
+  } catch (err) {
+    console.error("Supplier link error:", err);
+    res.status(500).json({ error: "Failed to create supplier link" });
+  }
+});
+
+payablesRouter.put("/company", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  try {
+    const companyName = String(req.body.companyName ?? "").trim();
+    if (!companyName) return res.status(400).json({ error: "Company name is required" });
+    await connectMongo();
+    const profile = await PayablesCompanyProfile.findOneAndUpdate(
+      { uid: actor.uid },
+      {
+        uid: actor.uid,
+        companyName,
+        industry: String(req.body.industry ?? "").trim(),
+        monthlyInvoices: String(req.body.monthlyInvoices ?? "").trim(),
+        onboarded: true,
+        gmailAutoImportEnabled: req.body.gmailAutoImportEnabled !== false,
+        notificationEmail: String(req.body.notificationEmail ?? actor.email ?? "").trim(),
+      },
+      { upsert: true, new: true }
+    );
+    await PayablesTeamMember.updateOne(
+      { uid: actor.uid, email: actor.email ?? actor.uid, role: "owner" },
+      { $setOnInsert: { uid: actor.uid, email: actor.email ?? actor.uid, name: companyName, role: "owner", status: "active" } },
+      { upsert: true }
+    );
+    await audit(actor.uid, undefined, "company_profile_saved", actor, { companyName });
+    res.json(profile);
+  } catch {
+    res.status(500).json({ error: "Failed to save company profile" });
+  }
+});
+
+payablesRouter.get("/settings", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const company = await PayablesCompanyProfile.findOne({ uid: actor.uid }).lean() as any;
+    res.json({
+      brandName: company?.brandName ?? company?.companyName ?? "",
+      senderDisplayName: company?.senderDisplayName ?? "",
+      supportEmail: company?.supportEmail ?? "",
+      companyAddress: company?.companyAddress ?? "",
+      paymentTermsDays: company?.paymentTermsDays ?? 30,
+      defaultCurrency: company?.defaultCurrency ?? "INR",
+      logoUrl: company?.logoUrl ?? "",
+      autoEmailOnReceive: company?.autoEmailOnReceive ?? false,
+      autoEmailOnApprove: company?.autoEmailOnApprove ?? true,
+      autoEmailOnReject: company?.autoEmailOnReject ?? true,
+      autoEmailOnFlag: company?.autoEmailOnFlag ?? false,
+    });
+  } catch {
+    res.status(500).json({ error: "Failed to fetch settings" });
+  }
+});
+
+payablesRouter.patch("/settings", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  try {
+    await connectMongo();
+    const allowed = [
+      "brandName", "senderDisplayName", "supportEmail", "companyAddress",
+      "paymentTermsDays", "defaultCurrency", "logoUrl",
+      "autoEmailOnReceive", "autoEmailOnApprove", "autoEmailOnReject", "autoEmailOnFlag",
+    ];
+    const update: Record<string, unknown> = {};
+    for (const key of allowed) if (Object.prototype.hasOwnProperty.call(req.body, key)) update[key] = req.body[key];
+    const company = await PayablesCompanyProfile.findOneAndUpdate(
+      { uid: actor.uid },
+      { $set: update },
+      { new: true, upsert: false }
+    );
+    if (!company) return res.status(404).json({ error: "Company profile not found. Complete onboarding first." });
+    await audit(actor.uid, undefined, "settings_updated", actor, { fields: Object.keys(update) });
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ error: "Failed to save settings" });
+  }
+});
+
+payablesRouter.get("/personalization", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const company = await PayablesCompanyProfile.findOne({ uid: actor.uid }).lean() as any;
+    if (!company) return res.json({ personalizationDone: false });
+    res.json({
+      personalizationDone: company.personalizationDone ?? false,
+      brandName: company.brandName ?? "",
+      brandDescription: company.brandDescription ?? "",
+      ownerName: company.ownerName ?? "",
+      teamSize: company.teamSize ?? "",
+      logoBase64: company.logoBase64 ?? "",
+      logoMimeType: company.logoMimeType ?? "",
+      gstNumber: company.gstNumber ?? "",
+      businessType: company.businessType ?? "",
+      businessCity: company.businessCity ?? "",
+      websiteUrl: company.websiteUrl ?? "",
+      preferredPaymentMethod: company.preferredPaymentMethod ?? "",
+      autoApprovalThreshold: company.autoApprovalThreshold ?? null,
+      fiscalYear: company.fiscalYear ?? "april-march",
+      expenseCategories: company.expenseCategories ?? [],
+      vendorCountRange: company.vendorCountRange ?? "",
+      hasInternationalInvoices: company.hasInternationalInvoices ?? false,
+      preferredLanguage: company.preferredLanguage ?? "english",
+      aiTone: company.aiTone ?? "professional",
+      alertMode: company.alertMode ?? "realtime",
+      financeContactEmail: company.financeContactEmail ?? "",
+      approvalHierarchy: company.approvalHierarchy ?? "flat",
+      defaultCurrency: company.defaultCurrency ?? "INR",
+      industry: company.industry ?? "",
+      companyName: company.companyName ?? "",
+    });
+  } catch {
+    res.status(500).json({ error: "Failed to fetch personalization" });
+  }
+});
+
+payablesRouter.put("/personalization", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  try {
+    await connectMongo();
+    const existing = await PayablesCompanyProfile.findOne({ uid: actor.uid }).lean() as any;
+    if (!existing) return res.status(404).json({ error: "Company profile not found. Complete onboarding first." });
+    const allowed = [
+      "brandName", "brandDescription", "ownerName", "teamSize",
+      "logoBase64", "logoMimeType",
+      "gstNumber", "businessType", "businessCity", "websiteUrl",
+      "preferredPaymentMethod", "autoApprovalThreshold", "fiscalYear",
+      "expenseCategories", "vendorCountRange", "hasInternationalInvoices",
+      "preferredLanguage", "aiTone", "alertMode",
+      "financeContactEmail", "approvalHierarchy", "defaultCurrency",
+    ];
+    const update: Record<string, unknown> = { personalizationDone: true };
+    for (const key of allowed) {
+      if (Object.prototype.hasOwnProperty.call(req.body, key)) update[key] = req.body[key];
+    }
+    await PayablesCompanyProfile.findOneAndUpdate(
+      { uid: actor.uid },
+      { $set: update },
+      { new: true }
+    );
+    await audit(actor.uid, undefined, "personalization_saved", actor, { fields: Object.keys(update) });
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ error: "Failed to save personalization" });
+  }
+});
+
+payablesRouter.get("/analyze", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const now = new Date();
+    const startOf30 = new Date(now); startOf30.setDate(now.getDate() - 30);
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const endOfLastMonth = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59);
+
+    const [allInvoices, company] = await Promise.all([
+      Invoice.find({ uid: actor.uid }).lean(),
+      PayablesCompanyProfile.findOne({ uid: actor.uid }).lean() as any,
+    ]);
+
+    const active = allInvoices.filter((inv: any) => !["rejected"].includes(inv.status));
+    const unpaid = allInvoices.filter((inv: any) => !["paid", "rejected"].includes(inv.status));
+    const currency = company?.defaultCurrency ?? "INR";
+
+    // ── AP HEALTH SCORE ──────────────────────────────────────────────
+    let score = 100;
+    const overdue = unpaid.filter((inv: any) => inv.dueDate && new Date(inv.dueDate) < now);
+    const criticalFlags = active.filter((inv: any) => inv.flags?.some((f: any) => f.severity === "critical"));
+    const warningFlags = active.filter((inv: any) => inv.flags?.some((f: any) => f.severity === "warning"));
+    const processingCount = allInvoices.filter((inv: any) => inv.status === "processing").length;
+    score -= Math.min(overdue.length * 8, 32);
+    score -= Math.min(criticalFlags.length * 12, 24);
+    score -= Math.min(warningFlags.length * 4, 16);
+    score -= Math.min(processingCount * 3, 12);
+    if (score > 90 && overdue.length === 0 && criticalFlags.length === 0) score = Math.min(score, 98);
+    score = Math.max(score, 0);
+
+    let healthLabel = "Excellent";
+    let healthColor = "green";
+    if (score < 50) { healthLabel = "Critical"; healthColor = "red"; }
+    else if (score < 70) { healthLabel = "Needs Attention"; healthColor = "amber"; }
+    else if (score < 85) { healthLabel = "Good"; healthColor = "blue"; }
+
+    // ── PRIORITY ACTIONS ─────────────────────────────────────────────
+    const priorityActions: Array<{ id: string; type: string; severity: string; title: string; description: string; invoiceId?: string; amount?: number; currency?: string; vendor?: string }> = [];
+
+    overdue.slice(0, 5).forEach((inv: any) => {
+      const daysLate = Math.ceil((now.getTime() - new Date(inv.dueDate).getTime()) / 86400000);
+      priorityActions.push({
+        id: `overdue-${inv._id}`,
+        type: "overdue",
+        severity: daysLate > 7 ? "critical" : "warning",
+        title: `Overdue by ${daysLate} day${daysLate !== 1 ? "s" : ""}`,
+        description: `Invoice from ${inv.vendor ?? "Unknown Vendor"} was due on ${new Date(inv.dueDate).toLocaleDateString("en-IN", { day: "numeric", month: "short" })}`,
+        invoiceId: inv._id.toString(),
+        amount: inv.total,
+        currency: inv.currency ?? currency,
+        vendor: inv.vendor,
+      });
+    });
+
+    const dueSoon = unpaid.filter((inv: any) => {
+      if (!inv.dueDate) return false;
+      const daysLeft = Math.ceil((new Date(inv.dueDate).getTime() - now.getTime()) / 86400000);
+      return daysLeft >= 0 && daysLeft <= 5;
+    });
+    dueSoon.slice(0, 3).forEach((inv: any) => {
+      const daysLeft = Math.ceil((new Date(inv.dueDate).getTime() - now.getTime()) / 86400000);
+      priorityActions.push({
+        id: `due-soon-${inv._id}`,
+        type: "due_soon",
+        severity: daysLeft <= 2 ? "warning" : "info",
+        title: `Due in ${daysLeft === 0 ? "today" : `${daysLeft} day${daysLeft !== 1 ? "s" : ""}`}`,
+        description: `Invoice from ${inv.vendor ?? "Unknown Vendor"} — act before the deadline`,
+        invoiceId: inv._id.toString(),
+        amount: inv.total,
+        currency: inv.currency ?? currency,
+        vendor: inv.vendor,
+      });
+    });
+
+    criticalFlags.slice(0, 3).forEach((inv: any) => {
+      const flag = inv.flags.find((f: any) => f.severity === "critical");
+      priorityActions.push({
+        id: `flag-${inv._id}`,
+        type: "flag",
+        severity: "critical",
+        title: "AI flagged this invoice",
+        description: flag?.message ?? `Suspicious activity detected on invoice from ${inv.vendor ?? "Unknown"}`,
+        invoiceId: inv._id.toString(),
+        amount: inv.total,
+        currency: inv.currency ?? currency,
+        vendor: inv.vendor,
+      });
+    });
+
+    const pendingApproval = unpaid.filter((inv: any) => inv.status === "pending_approval");
+    if (pendingApproval.length > 3) {
+      priorityActions.push({
+        id: "approval-backlog",
+        type: "backlog",
+        severity: "warning",
+        title: `${pendingApproval.length} invoices awaiting approval`,
+        description: "Your approval queue is building up. Review and approve or reject them.",
+      });
+    }
+
+    // ── DUPLICATE DETECTION ──────────────────────────────────────────
+    const duplicates: Array<{ invoiceId: string; matchId: string; vendor: string; amount: number; currency: string; reason: string; confidence: string }> = [];
+    const seen: Map<string, any> = new Map();
+    const extracted = active.filter((inv: any) => inv.status !== "processing" && inv.vendor && inv.total);
+    for (const inv of extracted) {
+      const vendor = (inv.vendor ?? "").toLowerCase().trim();
+      const amount = Math.round((inv.total ?? 0) * 100) / 100;
+      const dateStr = inv.invoiceDate ? new Date(inv.invoiceDate).toDateString() : "";
+      const exactKey = `${vendor}:${amount}:${inv.invoiceNumber ?? ""}`;
+      const approxKey = `${vendor}:${amount}`;
+
+      if (inv.invoiceNumber && seen.has(exactKey)) {
+        const prev = seen.get(exactKey);
+        duplicates.push({ invoiceId: inv._id.toString(), matchId: prev._id.toString(), vendor: inv.vendor, amount, currency: inv.currency ?? currency, reason: "Same vendor, same amount, same invoice number", confidence: "High" });
+      } else if (seen.has(approxKey)) {
+        const prev = seen.get(approxKey);
+        const daysDiff = Math.abs((new Date(inv.createdAt).getTime() - new Date(prev.createdAt).getTime()) / 86400000);
+        if (daysDiff <= 14) {
+          duplicates.push({ invoiceId: inv._id.toString(), matchId: prev._id.toString(), vendor: inv.vendor, amount, currency: inv.currency ?? currency, reason: `Same vendor and amount, ${Math.round(daysDiff)} day${daysDiff !== 1 ? "s" : ""} apart`, confidence: daysDiff <= 3 ? "High" : "Medium" });
+        }
+      }
+      if (!seen.has(exactKey)) seen.set(exactKey, inv);
+      if (!seen.has(approxKey)) seen.set(approxKey, inv);
+    }
+
+    // ── FRAUD / ANOMALY SIGNALS ──────────────────────────────────────
+    const fraudSignals: Array<{ invoiceId: string; vendor: string; type: string; description: string; severity: string }> = [];
+    const vendorBankMap: Map<string, string> = new Map();
+    const vendorGstinMap: Map<string, string> = new Map();
+    const vendorAmounts: Map<string, number[]> = new Map();
+
+    const sortedByDate = [...active].sort((a: any, b: any) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    for (const inv of sortedByDate) {
+      const vendor = (inv.vendor ?? "").toLowerCase().trim();
+      if (!vendor) continue;
+      const acct = inv.bankDetails?.accountNumber ?? "";
+      const gstin = inv.supplierGstin ?? "";
+      const amt = inv.total ?? 0;
+
+      if (acct && vendorBankMap.has(vendor) && vendorBankMap.get(vendor) !== acct) {
+        fraudSignals.push({ invoiceId: inv._id.toString(), vendor: inv.vendor, type: "bank_change", description: `Bank account changed from previous invoice — verify with ${inv.vendor} before paying`, severity: "critical" });
+      }
+      if (gstin && vendorGstinMap.has(vendor) && vendorGstinMap.get(vendor) !== gstin) {
+        fraudSignals.push({ invoiceId: inv._id.toString(), vendor: inv.vendor, type: "gstin_mismatch", description: `GSTIN changed from previous invoice — possible fraud indicator`, severity: "critical" });
+      }
+      if (amt > 0 && vendorAmounts.has(vendor)) {
+        const prevAmounts = vendorAmounts.get(vendor)!;
+        const avg = prevAmounts.reduce((s, x) => s + x, 0) / prevAmounts.length;
+        if (avg > 0 && amt > avg * 2.5) {
+          fraudSignals.push({ invoiceId: inv._id.toString(), vendor: inv.vendor, type: "amount_spike", description: `Amount is ${Math.round(amt / avg)}× higher than this vendor's average — review carefully`, severity: "warning" });
+        }
+      }
+
+      if (acct && !vendorBankMap.has(vendor)) vendorBankMap.set(vendor, acct);
+      if (gstin && !vendorGstinMap.has(vendor)) vendorGstinMap.set(vendor, gstin);
+      if (!vendorAmounts.has(vendor)) vendorAmounts.set(vendor, []);
+      vendorAmounts.get(vendor)!.push(amt);
+    }
+
+    // ── CASH FORECAST ─────────────────────────────────────────────────
+    const forecastBuckets = { d7: 0, d14: 0, d30: 0, d7Count: 0, d14Count: 0, d30Count: 0 };
+    unpaid.forEach((inv: any) => {
+      if (!inv.dueDate || !inv.total) return;
+      const days = Math.ceil((new Date(inv.dueDate).getTime() - now.getTime()) / 86400000);
+      if (days >= 0 && days <= 7) { forecastBuckets.d7 += inv.total; forecastBuckets.d7Count++; }
+      if (days >= 0 && days <= 14) { forecastBuckets.d14 += inv.total; forecastBuckets.d14Count++; }
+      if (days >= 0 && days <= 30) { forecastBuckets.d30 += inv.total; forecastBuckets.d30Count++; }
+    });
+
+    // Daily breakdown for sparkline (next 14 days)
+    const dailyForecast: Array<{ day: string; amount: number }> = [];
+    for (let i = 0; i <= 13; i++) {
+      const d = new Date(now); d.setDate(now.getDate() + i);
+      const dayStr = d.toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+      const amount = unpaid
+        .filter((inv: any) => inv.dueDate && Math.ceil((new Date(inv.dueDate).getTime() - now.getTime()) / 86400000) === i && inv.total)
+        .reduce((s: number, inv: any) => s + (inv.total ?? 0), 0);
+      dailyForecast.push({ day: dayStr, amount });
+    }
+
+    // ── VENDOR INTELLIGENCE ───────────────────────────────────────────
+    const vendorMap: Map<string, { count: number; total: number; currency: string; lastSeen: Date; isNew: boolean }> = new Map();
+    active.forEach((inv: any) => {
+      const vname = inv.vendor ?? "Unknown";
+      const existing = vendorMap.get(vname);
+      const invDate = new Date(inv.createdAt);
+      const isNew = invDate >= startOf30;
+      if (existing) {
+        existing.count++;
+        existing.total += inv.total ?? 0;
+        if (invDate > existing.lastSeen) existing.lastSeen = invDate;
+      } else {
+        vendorMap.set(vname, { count: 1, total: inv.total ?? 0, currency: inv.currency ?? currency, lastSeen: invDate, isNew });
+      }
+    });
+    const topVendors = [...vendorMap.entries()]
+      .sort((a, b) => b[1].total - a[1].total)
+      .slice(0, 6)
+      .map(([name, data]) => ({ name, ...data, lastSeen: data.lastSeen.toISOString() }));
+    const newVendors = [...vendorMap.entries()]
+      .filter(([, d]) => d.isNew && d.count <= 2)
+      .slice(0, 5)
+      .map(([name, data]) => ({ name, ...data, lastSeen: data.lastSeen.toISOString() }));
+    const totalVendors = vendorMap.size;
+
+    // ── EXCEPTION REPORT ─────────────────────────────────────────────
+    const exceptions: Array<{ invoiceId: string; vendor: string; amount: number; currency: string; reasons: string[]; severity: string }> = [];
+    unpaid.filter((inv: any) => inv.status !== "processing").forEach((inv: any) => {
+      const reasons: string[] = [];
+      if (!inv.dueDate) reasons.push("No due date — payment timeline unknown");
+      if (!inv.invoiceNumber) reasons.push("Missing invoice number");
+      if (!inv.total || inv.total === 0) reasons.push("Zero or missing amount");
+      if (inv.confidence != null && inv.confidence < 0.6) reasons.push(`Low AI confidence (${Math.round((inv.confidence ?? 0) * 100)}%) — manual review needed`);
+      if (inv.isNewVendor) reasons.push("First invoice from this vendor");
+      if (inv.flags?.some((f: any) => f.severity === "critical")) {
+        inv.flags.filter((f: any) => f.severity === "critical").forEach((f: any) => reasons.push(f.message));
+      }
+      if (reasons.length > 0) {
+        const hasCritical = inv.flags?.some((f: any) => f.severity === "critical") || !inv.total;
+        exceptions.push({ invoiceId: inv._id.toString(), vendor: inv.vendor ?? "Unknown", amount: inv.total ?? 0, currency: inv.currency ?? currency, reasons, severity: hasCritical ? "critical" : "warning" });
+      }
+    });
+
+    // ── MONTH-OVER-MONTH ──────────────────────────────────────────────
+    const thisMonthInvs = allInvoices.filter((inv: any) => new Date(inv.createdAt) >= startOfMonth);
+    const lastMonthInvs = allInvoices.filter((inv: any) => {
+      const d = new Date(inv.createdAt);
+      return d >= startOfLastMonth && d <= endOfLastMonth;
+    });
+    const momThis = { count: thisMonthInvs.length, total: thisMonthInvs.reduce((s: number, i: any) => s + (i.total ?? 0), 0) };
+    const momLast = { count: lastMonthInvs.length, total: lastMonthInvs.reduce((s: number, i: any) => s + (i.total ?? 0), 0) };
+    const momCountChange = momLast.count > 0 ? Math.round(((momThis.count - momLast.count) / momLast.count) * 100) : null;
+    const momSpendChange = momLast.total > 0 ? Math.round(((momThis.total - momLast.total) / momLast.total) * 100) : null;
+    const approvedThis = thisMonthInvs.filter((i: any) => i.approvedAt).length;
+    const avgApprovalDays = approvedThis > 0
+      ? Math.round(thisMonthInvs.filter((i: any) => i.approvedAt).reduce((s: number, i: any) => s + Math.abs((new Date(i.approvedAt).getTime() - new Date(i.createdAt).getTime()) / 86400000), 0) / approvedThis)
+      : null;
+
+    res.json({
+      generatedAt: now.toISOString(),
+      currency,
+      healthScore: score,
+      healthLabel,
+      healthColor,
+      priorityActions,
+      duplicates,
+      fraudSignals,
+      cashForecast: { ...forecastBuckets, dailyForecast },
+      vendorIntelligence: { topVendors, newVendors, totalVendors },
+      exceptions,
+      monthOverMonth: { thisMonth: momThis, lastMonth: momLast, countChange: momCountChange, spendChange: momSpendChange, avgApprovalDays },
+      summary: {
+        totalActive: active.length,
+        overdueCount: overdue.length,
+        overdueAmount: overdue.reduce((s: number, i: any) => s + (i.total ?? 0), 0),
+        pendingApprovalCount: pendingApproval.length,
+        flaggedCount: criticalFlags.length + warningFlags.length,
+        duplicateCount: duplicates.length,
+        fraudCount: fraudSignals.length,
+        exceptionCount: exceptions.length,
+      },
+    });
+  } catch (err) {
+    console.error("Analyze error:", err);
+    res.status(500).json({ error: "Failed to generate analysis" });
+  }
+});
+
+payablesRouter.get("/analyze/action-plan", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const endOfLastMonth = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59);
+
+    const [allInvoices, company] = await Promise.all([
+      Invoice.find({ uid: actor.uid }).lean(),
+      PayablesCompanyProfile.findOne({ uid: actor.uid }).lean() as any,
+    ]);
+
+    const currency = company?.defaultCurrency ?? "INR";
+    const brandName = company?.brandName ?? company?.companyName ?? "your business";
+    const ownerName = company?.ownerName ?? null;
+    const unpaid = allInvoices.filter((inv: any) => !["paid", "rejected"].includes(inv.status));
+    const overdue = unpaid.filter((inv: any) => inv.dueDate && new Date(inv.dueDate) < now);
+    const dueSoon = unpaid.filter((inv: any) => {
+      if (!inv.dueDate) return false;
+      const days = Math.ceil((new Date(inv.dueDate).getTime() - now.getTime()) / 86400000);
+      return days >= 0 && days <= 5;
+    });
+    const criticalFlags = allInvoices.filter((inv: any) => !["rejected"].includes(inv.status) && inv.flags?.some((f: any) => f.severity === "critical"));
+    const pendingApproval = unpaid.filter((inv: any) => inv.status === "pending_approval");
+    const thisMonthTotal = allInvoices.filter((inv: any) => new Date(inv.createdAt) >= startOfMonth).reduce((s: number, i: any) => s + (i.total ?? 0), 0);
+    const lastMonthTotal = allInvoices.filter((inv: any) => { const d = new Date(inv.createdAt); return d >= startOfLastMonth && d <= endOfLastMonth; }).reduce((s: number, i: any) => s + (i.total ?? 0), 0);
+    const d7Amount = unpaid.filter((inv: any) => { if (!inv.dueDate) return false; const d = Math.ceil((new Date(inv.dueDate).getTime() - now.getTime()) / 86400000); return d >= 0 && d <= 7; }).reduce((s: number, i: any) => s + (i.total ?? 0), 0);
+
+    let healthScore = 100;
+    healthScore -= Math.min(overdue.length * 8, 32);
+    healthScore -= Math.min(criticalFlags.length * 12, 24);
+    healthScore -= Math.min(pendingApproval.length * 2, 12);
+    healthScore = Math.max(healthScore, 0);
+
+    const today = now.toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "long" });
+    const fmtAmt = (n: number) => new Intl.NumberFormat("en-IN", { style: "currency", currency, minimumFractionDigits: Number.isInteger(n) ? 0 : 2, maximumFractionDigits: 2 }).format(n);
+
+    const summaryLines = [
+      `Today is ${today}.`,
+      `Business: ${brandName}${ownerName ? `, Contact: ${ownerName}` : ""}.`,
+      `AP Health Score: ${healthScore}/100.`,
+      overdue.length > 0 ? `Overdue invoices: ${overdue.length} (${fmtAmt(overdue.reduce((s: number, i: any) => s + (i.total ?? 0), 0))} total overdue).` : "No overdue invoices.",
+      dueSoon.length > 0 ? `Due in next 5 days: ${dueSoon.length} invoice${dueSoon.length > 1 ? "s" : ""}.` : "",
+      criticalFlags.length > 0 ? `Critical flags: ${criticalFlags.length} invoice${criticalFlags.length > 1 ? "s" : ""} flagged as suspicious.` : "No critical flags.",
+      pendingApproval.length > 0 ? `Pending approval: ${pendingApproval.length} invoice${pendingApproval.length > 1 ? "s" : ""} waiting.` : "",
+      d7Amount > 0 ? `Cash due in next 7 days: ${fmtAmt(d7Amount)}.` : "No payments due in next 7 days.",
+      thisMonthTotal > 0 ? `This month spend so far: ${fmtAmt(thisMonthTotal)}${lastMonthTotal > 0 ? ` (last month: ${fmtAmt(lastMonthTotal)})` : ""}.` : "",
+    ].filter(Boolean).join(" ");
+
+    const prompt = `You are a concise, professional AI finance assistant for a small business accounts payable system called Plyndrox.
+
+Here is today's AP summary for ${brandName}:
+${summaryLines}
+
+Write a "Today's Action Plan" — a sharp, motivating 2-3 sentence briefing that:
+1. Acknowledges the most urgent issue first (overdue invoices, critical flags, or upcoming payments).
+2. Tells the user specifically what they should do today to protect their business.
+3. Ends with one forward-looking note (e.g. cash position, trend, or next priority after today's tasks).
+
+Rules:
+- Write in second person ("You have...", "Your...", "Start by...").
+- Do NOT use bullet points, headers, or markdown. Plain prose only.
+- Keep it under 80 words total.
+- Sound like a trusted CFO advisor, not a robot.
+- Use exact currency amounts from the summary. Do not abbreviate, round, or approximate money as K, L, lakh, or crore.
+- If everything looks healthy, acknowledge it warmly and suggest a proactive action.`;
+
+    let briefing = "";
+    try {
+      briefing = await callNvidiaChatCompletions({
+        apiKey: NVIDIA_API_KEY,
+        model: "nvidia/llama-3.1-nemotron-70b-instruct",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.6,
+        max_tokens: 200,
+      });
+      briefing = briefing.replace(/^["']|["']$/g, "").trim();
+    } catch {
+      if (overdue.length > 0) {
+        briefing = `You have ${overdue.length} overdue invoice${overdue.length > 1 ? "s" : ""} that need immediate attention. Start by reviewing and paying the most critical ones to avoid late penalties. Your ${dueSoon.length > 0 ? `${dueSoon.length} upcoming due date${dueSoon.length > 1 ? "s" : ""} in the next 5 days should be your next priority` : "pending approvals should be cleared next"}.`;
+      } else if (criticalFlags.length > 0) {
+        briefing = `Your AP health looks mostly good, but ${criticalFlags.length} invoice${criticalFlags.length > 1 ? "s have" : " has"} been flagged as suspicious. Review these before approving any payments today. Once cleared, focus on processing your pending approvals to keep the workflow moving.`;
+      } else {
+        briefing = `Your accounts payable is in great shape today — no overdue invoices and no critical flags. Take a moment to review any pending approvals and confirm your upcoming payment schedule. Staying proactive now will protect your cash flow for the weeks ahead.`;
+      }
+    }
+
+    res.json({ briefing, generatedAt: now.toISOString(), healthScore });
+  } catch (err) {
+    console.error("Action plan error:", err);
+    res.status(500).json({ error: "Failed to generate action plan" });
+  }
+});
+
+payablesRouter.get("/scheduler", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const now = new Date();
+    const todayStr = now.toISOString().split("T")[0];
+
+    const invoices = await Invoice.find({
+      uid: actor.uid,
+      status: { $in: ["approved", "pending_approval", "extracted"] },
+    }).lean() as any[];
+
+    const fmtAmt = (n: number, c = "INR") => {
+      const code = c?.trim().toUpperCase() || "INR";
+      try {
+        return new Intl.NumberFormat("en-IN", { style: "currency", currency: code, minimumFractionDigits: Number.isInteger(n) ? 0 : 2, maximumFractionDigits: 2 }).format(n);
+      } catch {
+        return `${code} ${n.toLocaleString("en-IN")}`;
+      }
+    };
+
+    type Bucket = { key: string; label: string; color: string; urgency: number; invoices: any[]; total: number };
+    const buckets: Record<string, Bucket> = {
+      overdue: { key: "overdue", label: "Overdue", color: "red", urgency: 0, invoices: [], total: 0 },
+      today: { key: "today", label: "Due Today", color: "orange", urgency: 1, invoices: [], total: 0 },
+      this_week: { key: "this_week", label: "Due This Week (1–7 days)", color: "yellow", urgency: 2, invoices: [], total: 0 },
+      next_week: { key: "next_week", label: "Due Next Week (8–14 days)", color: "blue", urgency: 3, invoices: [], total: 0 },
+      later: { key: "later", label: "Due Later (15+ days)", color: "green", urgency: 4, invoices: [], total: 0 },
+      no_due: { key: "no_due", label: "No Due Date Set", color: "gray", urgency: 5, invoices: [], total: 0 },
+    };
+
+    for (const inv of invoices) {
+      const row = {
+        id: inv._id.toString(),
+        vendor: inv.vendor ?? "Unknown Vendor",
+        invoiceNumber: inv.invoiceNumber ?? "N/A",
+        total: inv.total ?? 0,
+        currency: inv.currency ?? "INR",
+        dueDate: inv.dueDate ?? null,
+        status: inv.status,
+        hasCriticalFlag: inv.flags?.some((f: any) => f.severity === "critical") ?? false,
+        bankDetails: inv.bankDetails ?? null,
+      };
+      if (!inv.dueDate) { buckets.no_due.invoices.push(row); buckets.no_due.total += row.total; continue; }
+      const due = new Date(inv.dueDate);
+      const dueDateStr = due.toISOString().split("T")[0];
+      const daysUntil = Math.ceil((due.getTime() - now.setHours(0,0,0,0)) / 86400000);
+      if (daysUntil < 0) { buckets.overdue.invoices.push(row); buckets.overdue.total += row.total; }
+      else if (dueDateStr === todayStr) { buckets.today.invoices.push(row); buckets.today.total += row.total; }
+      else if (daysUntil <= 7) { buckets.this_week.invoices.push(row); buckets.this_week.total += row.total; }
+      else if (daysUntil <= 14) { buckets.next_week.invoices.push(row); buckets.next_week.total += row.total; }
+      else { buckets.later.invoices.push(row); buckets.later.total += row.total; }
+    }
+
+    const sortedBuckets = Object.values(buckets)
+      .filter(b => b.invoices.length > 0)
+      .sort((a, b) => a.urgency - b.urgency);
+
+    const totalScheduled = invoices.reduce((s, i) => s + (i.total ?? 0), 0);
+
+    // Build AI prompt
+    const vendorGroupMap: Record<string, { count: number; total: number; bucket: string }> = {};
+    for (const b of sortedBuckets) {
+      for (const inv of b.invoices) {
+        if (!vendorGroupMap[inv.vendor]) vendorGroupMap[inv.vendor] = { count: 0, total: 0, bucket: b.key };
+        vendorGroupMap[inv.vendor].count++;
+        vendorGroupMap[inv.vendor].total += inv.total;
+      }
+    }
+    const multiInvoiceVendors = Object.entries(vendorGroupMap).filter(([, v]) => v.count > 1);
+    const summary = [
+      `Total unpaid invoices: ${invoices.length} worth ${fmtAmt(totalScheduled)}.`,
+      buckets.overdue.invoices.length > 0 ? `OVERDUE: ${buckets.overdue.invoices.length} invoices totaling ${fmtAmt(buckets.overdue.total)} — immediate risk.` : null,
+      buckets.today.invoices.length > 0 ? `DUE TODAY: ${buckets.today.invoices.length} invoices totaling ${fmtAmt(buckets.today.total)}.` : null,
+      buckets.this_week.invoices.length > 0 ? `THIS WEEK: ${buckets.this_week.invoices.length} invoices totaling ${fmtAmt(buckets.this_week.total)}.` : null,
+      buckets.next_week.invoices.length > 0 ? `NEXT WEEK: ${buckets.next_week.invoices.length} invoices totaling ${fmtAmt(buckets.next_week.total)}.` : null,
+      multiInvoiceVendors.length > 0 ? `Vendors with multiple invoices (batch candidates): ${multiInvoiceVendors.map(([v, d]) => `${v} (${d.count} invoices, ${fmtAmt(d.total)})`).join(", ")}.` : null,
+    ].filter(Boolean).join(" ");
+
+    let aiRecommendation = "";
+    try {
+      aiRecommendation = await callNvidiaChatCompletions({
+        apiKey: NVIDIA_API_KEY,
+        model: "nvidia/llama-3.1-nemotron-70b-instruct",
+        messages: [{
+          role: "user",
+          content: `You are a concise CFO-level payment advisor for a small business accounts payable system.
+
+AP Schedule Summary: ${summary}
+
+Write a smart payment scheduling recommendation in 3 short sentences:
+1. Start with the most urgent action (overdue or today if any, otherwise this week).
+2. Mention any batching opportunities (vendors with multiple invoices = pay together for fewer transactions).
+3. End with a cash flow tip or sequencing advice for the coming weeks.
+
+Rules: Plain prose only, no bullet points, no markdown, second person ("You have…"), under 70 words total. Use exact currency amounts from the summary; do not abbreviate, round, or approximate money as K, L, lakh, or crore.`,
+        }],
+        temperature: 0.5,
+        max_tokens: 180,
+      });
+      aiRecommendation = aiRecommendation.replace(/^["']|["']$/g, "").trim();
+    } catch {
+      if (buckets.overdue.invoices.length > 0) {
+        aiRecommendation = `You have ${buckets.overdue.invoices.length} overdue invoice${buckets.overdue.invoices.length > 1 ? "s" : ""} — pay these first to stop late fees from accumulating. ${multiInvoiceVendors.length > 0 ? `Batch payments to ${multiInvoiceVendors[0][0]} to save on transaction fees. ` : ""}Then work through this week's schedule to stay ahead of your upcoming obligations.`;
+      } else {
+        aiRecommendation = `Your payment schedule looks clean — no overdue invoices. ${buckets.this_week.invoices.length > 0 ? `Focus on this week's ${buckets.this_week.invoices.length} payment${buckets.this_week.invoices.length > 1 ? "s" : ""} first. ` : ""}${multiInvoiceVendors.length > 0 ? `Consider batching multiple invoices from ${multiInvoiceVendors[0][0]} into a single payment to reduce transaction overhead.` : "Plan next week's payments now to keep your cash flow predictable."}`;
+      }
+    }
+
+    res.json({ buckets: sortedBuckets, totalScheduled, aiRecommendation, generatedAt: new Date().toISOString(), totalInvoices: invoices.length });
+  } catch (err) {
+    console.error("Scheduler error:", err);
+    res.status(500).json({ error: "Failed to generate schedule" });
+  }
+});
+
+payablesRouter.get("/settings/email-preview", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    const type = (req.query.type as EmailTemplateType) || "invoice_approved";
+    const settings = await getEmailSettings(actor.uid);
+    const sampleInv = {
+      invoiceNumber: "INV-2026-0001",
+      invoiceDate: new Date().toISOString(),
+      dueDate: (() => { const d = new Date(); d.setDate(d.getDate() + (settings.paymentTermsDays ?? 30)); return d.toISOString(); })(),
+      total: 174500,
+      currency: settings.defaultCurrency,
+      vendor: "Sample Supplier Co.",
+      vendorEmail: settings.supportEmail,
+      bankDetails: { bankName: "HDFC Bank", accountNumber: "****5678", ifscCode: "HDFC0001234" },
+      rejectionReason: "Invoice amount does not match the purchase order. Please resubmit with the correct amount.",
+      flagMessages: ["Invoice amount differs from PO by more than 10%.", "Duplicate invoice detected from the same vendor."],
+      paidAt: new Date().toISOString(),
+      paidNote: "Payment processed via NEFT.",
+    };
+    const html = buildEmailHtml(type, sampleInv, settings);
+    const subject = buildSubjectLine(type, sampleInv, settings);
+    res.json({ html, subject });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to generate preview" });
+  }
+});
+
+payablesPublicRouter.get("/team/invite-info", async (req, res) => {
+  const token = String(req.query.token ?? "").trim();
+  if (!token) return res.status(400).json({ error: "Token is required" });
+  await connectMongo();
+  const member = await PayablesTeamMember.findOne({ inviteToken: token }).lean();
+  if (!member) return res.status(404).json({ error: "Invite not found or already used" });
+  const [company, profile] = await Promise.all([
+    PayablesCompanyProfile.findOne({ uid: (member as any).uid }).lean(),
+    UserProfile.findOne({ uid: (member as any).uid }).lean(),
+  ]);
+  const workspaceName = (company as any)?.companyName || (profile as any)?.email || "a workspace";
+  res.json({
+    email: (member as any).email,
+    name: (member as any).name,
+    role: (member as any).role,
+    status: (member as any).status,
+    invitedBy: (member as any).invitedBy,
+    workspaceName,
+  });
+});
+
+payablesRouter.get("/team/workspaces", async (req, res) => {
+  const authUid = (req as any).user?.uid as string | undefined;
+  const authEmail = ((req as any).user?.email as string | undefined)?.toLowerCase();
+  if (!authUid) return res.status(401).json({ error: "Unauthorized" });
+  await connectMongo();
+  const [ownProfile, memberships] = await Promise.all([
+    PayablesCompanyProfile.findOne({ uid: authUid }).lean(),
+    authEmail ? PayablesTeamMember.find({ email: authEmail, status: "active" }).lean() : Promise.resolve([]),
+  ]);
+  const workspaces: Array<{ uid: string; name: string; role: string }> = [];
+  const ownName = (ownProfile as any)?.companyName || "My Workspace";
+  workspaces.push({ uid: authUid, name: ownName, role: "owner" });
+  for (const m of memberships as any[]) {
+    if (m.uid === authUid) continue;
+    const [wCompany, wProfile] = await Promise.all([
+      PayablesCompanyProfile.findOne({ uid: m.uid }).lean(),
+      UserProfile.findOne({ uid: m.uid }).lean(),
+    ]);
+    const name = (wCompany as any)?.companyName || (wProfile as any)?.email || "Workspace";
+    workspaces.push({ uid: m.uid, name, role: m.role });
+  }
+  res.json({ workspaces });
+});
+
+payablesRouter.get("/team/my-role", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  res.json({ role: actor.role, uid: actor.uid, actorUid: actor.actorUid, email: actor.email });
+});
+
+payablesRouter.get("/team", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  await connectMongo();
+  const members = await PayablesTeamMember.find({ uid: actor.uid }).sort({ role: 1, createdAt: -1 }).lean();
+  res.json({ members });
+});
+
+payablesRouter.post("/team", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  try {
+    const email = String(req.body.email ?? "").trim().toLowerCase();
+    if (!email || !email.includes("@")) return res.status(400).json({ error: "Valid email is required" });
+    await connectMongo();
+    const member = await PayablesTeamMember.findOneAndUpdate(
+      { uid: actor.uid, email },
+      {
+        uid: actor.uid,
+        email,
+        name: String(req.body.name ?? "").trim(),
+        role: ["admin", "approver", "viewer", "member"].includes(req.body.role) ? (req.body.role === "member" ? "viewer" : req.body.role) : "viewer",
+        status: "pending",
+        inviteToken: randomUUID(),
+        invitedBy: actor.email ?? actor.uid,
+      },
+      { upsert: true, new: true }
+    );
+    const inviteUrl = `${process.env.FRONTEND_URL ?? "https://www.plyndrox.app"}/payables/invite?token=${(member as any).inviteToken}`;
+    await audit(actor.uid, undefined, "team_member_invited", actor, { email, role: (member as any).role });
+    sendTeamInviteEmail(actor.uid, {
+      to: email,
+      inviteeName: String(req.body.name ?? "").trim() || undefined,
+      role: (member as any).role,
+      inviterName: actor.email,
+      inviteUrl,
+    }).catch(() => {});
+    res.json({ member, inviteUrl });
+  } catch {
+    res.status(500).json({ error: "Failed to invite team member" });
+  }
+});
+
+payablesRouter.post("/team/accept", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    const token = String(req.body.token ?? "").trim();
+    if (!token) return res.status(400).json({ error: "Invite token is required" });
+    await connectMongo();
+    const member = await PayablesTeamMember.findOne({ inviteToken: token });
+    if (!member) return res.status(404).json({ error: "Invite not found" });
+    if (actor.email && (member as any).email && actor.email.toLowerCase() !== (member as any).email.toLowerCase()) {
+      return res.status(403).json({ error: "This invite belongs to a different email address" });
+    }
+    (member as any).status = "active";
+    (member as any).acceptedAt = new Date();
+    await member.save();
+    await audit((member as any).uid, undefined, "team_member_accepted", actor, { email: (member as any).email });
+    res.json({ success: true, workspaceUid: (member as any).uid, member });
+  } catch {
+    res.status(500).json({ error: "Failed to accept invite" });
+  }
+});
+
+payablesRouter.patch("/team/:id", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  await connectMongo();
+  const update: Record<string, unknown> = {};
+  if (["admin", "approver", "viewer", "member"].includes(req.body.role)) update.role = req.body.role === "member" ? "viewer" : req.body.role;
+  if (["pending", "active", "disabled"].includes(req.body.status)) update.status = req.body.status;
+  if (typeof req.body.name === "string") update.name = req.body.name.trim();
+  const member = await PayablesTeamMember.findOneAndUpdate({ _id: req.params.id, uid: actor.uid, role: { $ne: "owner" } }, update, { new: true });
+  if (!member) return res.status(404).json({ error: "Team member not found" });
+  await audit(actor.uid, undefined, "team_member_updated", actor, { memberId: req.params.id, update });
+  res.json(member);
+});
+
+payablesRouter.delete("/team/:id", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  await connectMongo();
+  await PayablesTeamMember.deleteOne({ _id: req.params.id, uid: actor.uid, role: { $ne: "owner" } });
+  await audit(actor.uid, undefined, "team_member_removed", actor, { memberId: req.params.id });
+  res.json({ success: true });
+});
+
+payablesRouter.get("/approval-rules", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  await connectMongo();
+  const rules = await PayablesApprovalRule.find({ uid: actor.uid }).sort({ minAmount: 1 }).lean();
+  res.json({ rules });
+});
+
+payablesRouter.post("/approval-rules", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  try {
+    const name = String(req.body.name ?? "").trim();
+    const approverEmail = String(req.body.approverEmail ?? "").trim().toLowerCase();
+    if (!name || !approverEmail.includes("@")) return res.status(400).json({ error: "Rule name and approver email are required" });
+    await connectMongo();
+    const rule = await PayablesApprovalRule.create({
+      uid: actor.uid,
+      name,
+      minAmount: Number(req.body.minAmount ?? 0),
+      maxAmount: req.body.maxAmount === "" || req.body.maxAmount == null ? undefined : Number(req.body.maxAmount),
+      currency: String(req.body.currency ?? "").trim().toUpperCase(),
+      approverEmail,
+      approverName: String(req.body.approverName ?? "").trim(),
+      active: req.body.active !== false,
+    });
+    await audit(actor.uid, undefined, "approval_rule_created", actor, { ruleId: rule._id.toString(), name });
+    res.json(rule);
+  } catch {
+    res.status(500).json({ error: "Failed to create approval rule" });
+  }
+});
+
+payablesRouter.patch("/approval-rules/:id", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  await connectMongo();
+  const allowed = ["name", "minAmount", "maxAmount", "currency", "approverEmail", "approverName", "active"];
+  const update: Record<string, unknown> = {};
+  for (const key of allowed) if (Object.prototype.hasOwnProperty.call(req.body, key)) update[key] = req.body[key];
+  const rule = await PayablesApprovalRule.findOneAndUpdate({ _id: req.params.id, uid: actor.uid }, update, { new: true });
+  if (!rule) return res.status(404).json({ error: "Approval rule not found" });
+  await audit(actor.uid, undefined, "approval_rule_updated", actor, { ruleId: req.params.id });
+  res.json(rule);
+});
+
+payablesRouter.delete("/approval-rules/:id", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  await connectMongo();
+  await PayablesApprovalRule.deleteOne({ _id: req.params.id, uid: actor.uid });
+  await audit(actor.uid, undefined, "approval_rule_deleted", actor, { ruleId: req.params.id });
+  res.json({ success: true });
+});
+
+payablesRouter.get("/gmail/auth-url", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+    return res.status(503).json({ error: "Google OAuth is not configured on the server." });
+  }
+  const returnTo = typeof req.query.returnTo === "string" && req.query.returnTo.startsWith("/payables")
+    ? req.query.returnTo
+    : "/payables/onboarding?gmail=connected";
+  const state = signOAuthState({
+    workspaceUid: actor.uid,
+    actorUid: actor.actorUid,
+    product: "payables",
+    returnTo,
+    nonce: randomUUID(),
+    createdAt: Date.now(),
+  });
+  const oauth2 = makeOAuth2Client();
+  const url = oauth2.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: [
+      "https://www.googleapis.com/auth/gmail.modify",
+      "https://www.googleapis.com/auth/gmail.send",
+      "https://www.googleapis.com/auth/userinfo.email",
+    ],
+    state,
+  });
+  res.json({ url });
+});
+
+payablesRouter.delete("/gmail/disconnect", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  await connectMongo();
+  await InboxToken.deleteOne({ uid: actor.uid });
+  await audit(actor.uid, undefined, "gmail_disconnected", actor);
+  res.json({ success: true });
+});
+
+payablesRouter.get("/notifications", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  await connectMongo();
+  const notifications = await PayablesNotification.find({ uid: actor.uid }).sort({ createdAt: -1 }).limit(50).lean();
+  const unreadCount = await PayablesNotification.countDocuments({ uid: actor.uid, readAt: { $exists: false } });
+  res.json({ notifications, unreadCount });
+});
+
+payablesRouter.post("/notifications/mark-read", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  await connectMongo();
+  await PayablesNotification.updateMany({ uid: actor.uid, readAt: { $exists: false } }, { $set: { readAt: new Date() } });
+  res.json({ success: true });
+});
+
+payablesRouter.post("/upload", upload.single("invoice"), async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  try {
+    if (!req.file) return res.status(400).json({ error: "No file provided" });
+    await connectMongo();
+    const invoice = new Invoice({
+      uid: actor.uid,
+      source: "upload",
+      status: "processing",
+      originalFileName: req.file.originalname,
+      originalMimeType: req.file.mimetype,
+      originalFileData: req.file.buffer.toString("base64"),
+    }) as any;
+    await invoice.save();
+    await audit(actor.uid, invoice._id.toString(), "invoice_uploaded", actor, { fileName: req.file.originalname });
+    await notify(actor.uid, { invoiceId: invoice._id.toString(), key: `new:${invoice._id.toString()}`, type: "new_invoice", title: "New invoice uploaded", message: `${req.file.originalname} was uploaded and AI extraction has started.`, severity: "info" });
+
+    setImmediate(async () => {
+      try {
+        await extractAndApplyInvoice(invoice);
+        await analyzeInvoice(invoice._id.toString(), actor.uid);
+      } catch {
+        invoice.status = "extracted";
+        await invoice.save();
+      }
+    });
+
+    res.json({ success: true, invoiceId: invoice._id });
+  } catch (err) {
+    console.error("Payables upload error:", err);
+    res.status(500).json({ error: "Upload failed" });
+  }
+});
+
+payablesRouter.post("/fetch-gmail", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  try {
+    await connectMongo();
+    let auth: Awaited<ReturnType<typeof getGmailClient>>;
+    try {
+      auth = await getGmailClient(actor.uid);
+    } catch {
+      return res.status(400).json({ error: "Gmail not connected. Please connect your Gmail first." });
+    }
+
+    const gmail = google.gmail({ version: "v1", auth });
+    const listRes = await gmail.users.messages.list({
+      userId: "me",
+      q: 'subject:(invoice OR "payment due" OR "bill" OR receipt) has:attachment -in:sent newer_than:30d',
+      maxResults: 20,
+    });
+
+    const messages = listRes.data.messages ?? [];
+    if (!messages.length) return res.json({ success: true, fetched: 0, message: "No invoice emails found in the last 30 days." });
+    let fetched = 0;
+
+    for (const msg of messages) {
+      if (!msg.id) continue;
+      const existing = await Invoice.findOne({ uid: actor.uid, gmailMessageId: msg.id });
+      if (existing) continue;
+      const full = await gmail.users.messages.get({ userId: "me", id: msg.id, format: "full" });
+      const payload = full.data.payload;
+      if (!payload) continue;
+      const headers = payload.headers ?? [];
+      const subject = headers.find((h) => h.name === "Subject")?.value ?? "";
+      const from = headers.find((h) => h.name === "From")?.value ?? "";
+      const parts = collectParts(payload);
+      let bodyText = "";
+      for (const part of parts) if (part.mimeType === "text/plain" && part.body?.data) bodyText += decodeGmailData(part.body.data);
+      if (!bodyText && payload.body?.data) bodyText = decodeGmailData(payload.body.data);
+
+      let attachmentData = "";
+      let attachmentMime = "";
+      let attachmentName = "";
+      const attachmentPart = parts.find((part) => ["application/pdf", "image/jpeg", "image/png", "image/webp"].includes(part.mimeType) && (part.body?.attachmentId || part.body?.data));
+      if (attachmentPart) {
+        attachmentMime = attachmentPart.mimeType;
+        attachmentName = attachmentPart.filename || `${subject || "gmail-invoice"}`;
+        if (attachmentPart.body?.data) attachmentData = attachmentPart.body.data.replace(/-/g, "+").replace(/_/g, "/");
+        else if (attachmentPart.body?.attachmentId) {
+          const attachment = await gmail.users.messages.attachments.get({ userId: "me", messageId: msg.id, id: attachmentPart.body.attachmentId });
+          attachmentData = (attachment.data.data ?? "").replace(/-/g, "+").replace(/_/g, "/");
+        }
+      }
+
+      const rawText = `Subject: ${subject}\nFrom: ${from}\n\n${bodyText}`;
+      const invoice = new Invoice({
+        uid: actor.uid,
+        source: "gmail",
+        status: "processing",
+        gmailMessageId: msg.id,
+        rawText,
+        originalFileName: attachmentName || subject || "Gmail invoice",
+        originalMimeType: attachmentMime || undefined,
+        originalFileData: attachmentData || undefined,
+      }) as any;
+      await invoice.save();
+      await audit(actor.uid, invoice._id.toString(), "gmail_invoice_imported", actor, { subject, from });
+      await notify(actor.uid, { invoiceId: invoice._id.toString(), key: `new:${invoice._id.toString()}`, type: "new_invoice", title: "New Gmail invoice imported", message: `${subject || "A Gmail invoice"} was imported from ${from || "Gmail"} and AI extraction has started.`, severity: "info" });
+      fetched++;
+
+      setImmediate(async () => {
+        try {
+          await extractAndApplyInvoice(invoice);
+          await analyzeInvoice(invoice._id.toString(), actor.uid);
+        } catch {
+          invoice.status = "extracted";
+          await invoice.save();
+        }
+      });
+    }
+
+    res.json({ success: true, fetched });
+  } catch (err) {
+    console.error("Payables Gmail fetch error:", err);
+    res.status(500).json({ error: "Failed to fetch invoices from Gmail" });
+  }
+});
+
+payablesRouter.post("/invoices/bulk-action", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
+    const action = req.body.action;
+    if (!ids.length || !["approve", "reject", "paid", "delete", "analyze"].includes(action)) return res.status(400).json({ error: "Select invoices and a valid action" });
+    if (["paid", "delete"].includes(action) && !ensureManageWorkspace(actor, res)) return;
+    await connectMongo();
+    let updated = 0;
+    if (action === "delete") {
+      const result = await Invoice.deleteMany({ uid: actor.uid, _id: { $in: ids } });
+      updated = result.deletedCount ?? 0;
+    } else {
+      const invoices = await Invoice.find({ uid: actor.uid, _id: { $in: ids } });
+      for (const invoice of invoices as any[]) {
+        if (["approve", "reject"].includes(action) && !canApproveInvoice(actor, invoice)) continue;
+        if (action === "approve") { invoice.status = "approved"; invoice.approvedAt = new Date(); invoice.approvedBy = actor.email ?? actor.uid; }
+        if (action === "reject") { invoice.status = "rejected"; invoice.rejectedAt = new Date(); invoice.rejectionReason = req.body.reason ?? "Bulk rejected"; }
+        if (action === "paid") { invoice.status = "paid"; invoice.paidAt = new Date(); invoice.paymentAmount = invoice.total; }
+        if (action === "analyze") await extractAndApplyInvoice(invoice);
+        await invoice.save();
+        if (action === "analyze") await analyzeInvoice(invoice._id.toString(), actor.uid);
+        await audit(actor.uid, invoice._id.toString(), `bulk_${action}`, actor, { reason: req.body.reason });
+        updated++;
+      }
+    }
+    await notify(actor.uid, { key: `bulk:${action}:${Date.now()}`, type: "bulk_action", title: "Bulk action completed", message: `${updated} invoice${updated !== 1 ? "s" : ""} updated.`, severity: "success" });
+    res.json({ success: true, updated });
+  } catch {
+    res.status(500).json({ error: "Bulk action failed" });
+  }
+});
+
+payablesRouter.get("/invoices/export", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const { status } = req.query;
+    const format = String(req.query.format ?? "csv").toLowerCase();
+    const filter: Record<string, unknown> = { uid: actor.uid };
+    if (status && status !== "all") filter.status = status;
+    const invoices = await Invoice.find(filter).select("-originalFileData -rawText").sort({ createdAt: -1 }).lean() as any[];
+    const rows = invoiceExportRows(invoices);
+    const date = new Date().toISOString().split("T")[0];
+
+    if (format === "tally") {
+      const voucherXml = rows.map((row, index) => {
+        const voucherDate = row.invoiceDate ? String(row.invoiceDate).replace(/-/g, "") : date.replace(/-/g, "");
+        const voucherNumber = row.invoiceNumber || `PLY-${index + 1}`;
+        const purchaseLedger = "Purchase Accounts";
+        const taxLedger = row.tax > 0 ? "Input GST" : "";
+        return `
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <VOUCHER VCHTYPE="Purchase" ACTION="Create" OBJVIEW="Invoice Voucher View">
+            <DATE>${xmlEscape(voucherDate)}</DATE>
+            <VOUCHERTYPENAME>Purchase</VOUCHERTYPENAME>
+            <VOUCHERNUMBER>${xmlEscape(voucherNumber)}</VOUCHERNUMBER>
+            <REFERENCE>${xmlEscape(row.invoiceNumber)}</REFERENCE>
+            <REFERENCEDATE>${xmlEscape(voucherDate)}</REFERENCEDATE>
+            <PARTYLEDGERNAME>${xmlEscape(row.vendor)}</PARTYLEDGERNAME>
+            <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>
+            <NARRATION>${xmlEscape(`Imported from Plyndrox Payables. Vendor GSTIN: ${row.supplierGstin || "N/A"}. PO: ${row.poNumber || "N/A"}`)}</NARRATION>
+            <BASICBUYERNAME>${xmlEscape(row.buyerName)}</BASICBUYERNAME>
+            <PARTYGSTIN>${xmlEscape(row.supplierGstin)}</PARTYGSTIN>
+            <ALLLEDGERENTRIES.LIST>
+              <LEDGERNAME>${xmlEscape(row.vendor)}</LEDGERNAME>
+              <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+              <AMOUNT>${row.total.toFixed(2)}</AMOUNT>
+            </ALLLEDGERENTRIES.LIST>
+            <ALLLEDGERENTRIES.LIST>
+              <LEDGERNAME>${xmlEscape(purchaseLedger)}</LEDGERNAME>
+              <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+              <AMOUNT>-${row.subtotal.toFixed(2)}</AMOUNT>
+            </ALLLEDGERENTRIES.LIST>
+            ${row.tax > 0 ? `<ALLLEDGERENTRIES.LIST><LEDGERNAME>${xmlEscape(taxLedger)}</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-${row.tax.toFixed(2)}</AMOUNT></ALLLEDGERENTRIES.LIST>` : ""}
+          </VOUCHER>
+        </TALLYMESSAGE>`;
+      }).join("");
+      const xml = `<?xml version="1.0" encoding="UTF-8"?><ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY></SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA>${voucherXml}</REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+      res.setHeader("Content-Type", "application/xml; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="plyndrox-tally-import-${date}.xml"`);
+      res.send(xml);
+      return;
+    }
+
+    if (format === "quickbooks") {
+      sendCsv(res, `plyndrox-quickbooks-import-${date}.csv`, ["Bill No", "Supplier", "Supplier Email", "Bill Date", "Due Date", "Expense Account", "Description", "Amount", "GST/Tax", "Total", "Currency", "Memo"], rows.map((row) => [
+        row.invoiceNumber, row.vendor, row.vendorEmail, row.invoiceDate, row.dueDate, "Purchases", row.lineItems || "Invoice import", row.subtotal, row.tax, row.total, row.currency, `GSTIN: ${row.supplierGstin} PO: ${row.poNumber}`.trim(),
+      ]));
+      return;
+    }
+
+    if (format === "zoho") {
+      sendCsv(res, `plyndrox-zoho-bills-${date}.csv`, ["Bill Number", "Vendor Name", "Vendor Email", "GST Treatment", "GSTIN", "Bill Date", "Due Date", "Currency Code", "Sub Total", "Tax Amount", "Total", "Purchase Order", "Notes"], rows.map((row) => [
+        row.invoiceNumber, row.vendor, row.vendorEmail, row.supplierGstin ? "business_gst" : "unregistered", row.supplierGstin, row.invoiceDate, row.dueDate, row.currency, row.subtotal, row.tax, row.total, row.poNumber, row.lineItems,
+      ]));
+      return;
+    }
+
+    if (format === "excel") {
+      const headers = ["Invoice Number", "Vendor", "Vendor Email", "Vendor GSTIN", "Invoice Date", "Due Date", "Status", "Currency", "Subtotal", "Tax", "Discount", "Total", "Buyer Name", "Buyer GSTIN", "PO Number", "Bank Name", "Account Number", "IFSC", "HSN Codes", "Line Items", "Source", "Created At"];
+      const htmlRows = rows.map((row) => [row.invoiceNumber, row.vendor, row.vendorEmail, row.supplierGstin, row.invoiceDate, row.dueDate, row.status, row.currency, row.subtotal, row.tax, row.discount, row.total, row.buyerName, row.buyerGstin, row.poNumber, row.bankName, row.accountNumber, row.ifscCode, row.hsnCodes, row.lineItems, row.source, row.createdAt].map((cell) => `<td>${xmlEscape(cell)}</td>`).join(""));
+      const html = `<!doctype html><html><head><meta charset="utf-8"></head><body><table><thead><tr>${headers.map((h) => `<th>${xmlEscape(h)}</th>`).join("")}</tr></thead><tbody>${htmlRows.map((r) => `<tr>${r}</tr>`).join("")}</tbody></table></body></html>`;
+      res.setHeader("Content-Type", "application/vnd.ms-excel; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="plyndrox-invoices-${date}.xls"`);
+      res.send(html);
+      return;
+    }
+
+    const headers = ["Invoice Number", "Vendor", "Vendor Email", "Vendor GSTIN", "Vendor Address", "Invoice Date", "Due Date", "Status", "Currency", "Subtotal", "Tax", "Discount", "Total", "Buyer Name", "Buyer GSTIN", "PO Number", "Bank Name", "Account Number", "IFSC", "HSN Codes", "Line Items", "Source", "Created At"];
+    sendCsv(res, `plyndrox-payables-${date}.csv`, headers, rows.map((row) => [
+      row.invoiceNumber, row.vendor, row.vendorEmail, row.supplierGstin, row.vendorAddress, row.invoiceDate, row.dueDate, row.status, row.currency, row.subtotal, row.tax, row.discount, row.total, row.buyerName, row.buyerGstin, row.poNumber, row.bankName, row.accountNumber, row.ifscCode, row.hsnCodes, row.lineItems, row.source, row.createdAt,
+    ]));
+  } catch (err) {
+    console.error("Export error:", err);
+    res.status(500).json({ error: "Failed to export" });
+  }
+});
+
+payablesRouter.get("/invoices", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const { status, page = "1", limit = "20", q, flagged } = req.query;
+    const filter: Record<string, unknown> = { uid: actor.uid };
+    if (status && status !== "all") filter.status = status;
+    if (flagged === "true") filter["flags.0"] = { $exists: true };
+    if (q && typeof q === "string" && q.trim()) {
+      const regex = new RegExp(q.trim(), "i");
+      filter.$or = [{ vendor: regex }, { invoiceNumber: regex }, { vendorEmail: regex }];
+    }
+    const pageNum = Math.max(1, parseInt(page as string, 10));
+    const limitNum = Math.min(50, parseInt(limit as string, 10));
+    const skip = (pageNum - 1) * limitNum;
+    const [invoices, total] = await Promise.all([
+      Invoice.find(filter).select("-originalFileData").sort({ createdAt: -1 }).skip(skip).limit(limitNum).lean(),
+      Invoice.countDocuments(filter),
+    ]);
+    res.json({ invoices, total, page: pageNum, totalPages: Math.ceil(total / limitNum) });
+  } catch (err) {
+    console.error("Payables list error:", err);
+    res.status(500).json({ error: "Failed to fetch invoices" });
+  }
+});
+
+payablesRouter.get("/invoices/stats", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const [stats] = await Invoice.aggregate([
+      { $match: { uid: actor.uid } },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: 1 },
+          totalAmount: { $sum: "$total" },
+          pendingCount: { $sum: { $cond: [{ $eq: ["$status", "pending_approval"] }, 1, 0] } },
+          approvedCount: { $sum: { $cond: [{ $eq: ["$status", "approved"] }, 1, 0] } },
+          paidCount: { $sum: { $cond: [{ $eq: ["$status", "paid"] }, 1, 0] } },
+          processingCount: { $sum: { $cond: [{ $eq: ["$status", "processing"] }, 1, 0] } },
+          flaggedCount: { $sum: { $cond: [{ $gt: [{ $size: { $ifNull: ["$flags", []] } }, 0] }, 1, 0] } },
+          pendingAmount: { $sum: { $cond: [{ $eq: ["$status", "pending_approval"] }, { $ifNull: ["$total", 0] }, 0] } },
+          approvedAmount: { $sum: { $cond: [{ $eq: ["$status", "approved"] }, { $ifNull: ["$total", 0] }, 0] } },
+        },
+      },
+    ]);
+    res.json(stats ?? { total: 0, totalAmount: 0, pendingCount: 0, approvedCount: 0, paidCount: 0, processingCount: 0, flaggedCount: 0, pendingAmount: 0, approvedAmount: 0 });
+  } catch (err) {
+    console.error("Payables stats error:", err);
+    res.status(500).json({ error: "Failed to fetch stats" });
+  }
+});
+
+payablesRouter.get("/invoices/:id/document", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  await connectMongo();
+  const invoice = (await Invoice.findOne({ _id: req.params.id, uid: actor.uid }).select("originalFileData originalMimeType originalFileName")) as any;
+  if (!invoice?.originalFileData) return res.status(404).json({ error: "Document not found" });
+  res.setHeader("Content-Type", invoice.originalMimeType || "application/octet-stream");
+  res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(invoice.originalFileName || "invoice")}"`);
+  res.send(Buffer.from(invoice.originalFileData, "base64"));
+});
+
+payablesRouter.get("/invoices/:id", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const invoice = await Invoice.findOne({ _id: req.params.id, uid: actor.uid }).lean();
+    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    const auditLogs = await PayablesAuditLog.find({ uid: actor.uid, invoiceId: req.params.id }).sort({ createdAt: -1 }).limit(50).lean();
+    res.json({ ...sanitizeInvoice(invoice), auditLogs });
+  } catch (err) {
+    console.error("Payables get invoice error:", err);
+    res.status(500).json({ error: "Failed to fetch invoice" });
+  }
+});
+
+payablesRouter.patch("/invoices/:id", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const invoice = await Invoice.findOne({ _id: req.params.id, uid: actor.uid });
+    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    if (req.body.status === "approved" || req.body.status === "rejected") { if (!ensureCanApprove(actor, invoice, res)) return; }
+    else if (req.body.status === "paid") { if (!ensureManageWorkspace(actor, res)) return; }
+    else if (!canManageWorkspace(actor) && (actor.role ?? "") !== "approver") return res.status(403).json({ error: "Only admins and approvers can edit invoices" });
+    const body = normalizeExtractedData(req.body ?? {}, JSON.stringify(req.body ?? {}));
+    const allowed = [
+      "vendor", "vendorEmail", "vendorAddress", "supplierGstin",
+      "buyerName", "buyerEmail", "buyerAddress", "buyerGstin",
+      "invoiceNumber", "poNumber", "invoiceDate", "dueDate",
+      "currency", "subtotal", "tax", "discount", "total",
+      "lineItems", "notes", "bankDetails",
+      "status", "assignedApproverEmail", "assignedApproverName",
+    ];
+    for (const key of allowed) if (body[key] !== undefined) (invoice as any)[key] = body[key];
+    if (body.status === "approved") { (invoice as any).approvedAt = new Date(); (invoice as any).approvedBy = actor.email ?? actor.uid; }
+    if (body.status === "rejected") { (invoice as any).rejectedAt = new Date(); if (req.body.rejectionReason) (invoice as any).rejectionReason = req.body.rejectionReason; }
+    if (body.status === "paid") {
+      (invoice as any).paidAt = new Date();
+      if (req.body.paymentAmount !== undefined) (invoice as any).paymentAmount = req.body.paymentAmount;
+      if (req.body.paymentDate) (invoice as any).paymentDate = new Date(req.body.paymentDate);
+      if (req.body.paidNote) (invoice as any).paidNote = req.body.paidNote;
+    }
+    await invoice.save();
+    await audit(actor.uid, req.params.id, "invoice_updated", actor, { fields: Object.keys(req.body ?? {}) });
+    res.json(sanitizeInvoice(invoice));
+  } catch (err) {
+    console.error("Payables patch error:", err);
+    res.status(500).json({ error: "Failed to update invoice" });
+  }
+});
+
+payablesRouter.delete("/invoices/:id", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  try {
+    await connectMongo();
+    await Invoice.deleteOne({ _id: req.params.id, uid: actor.uid });
+    await audit(actor.uid, req.params.id, "invoice_deleted", actor);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Payables delete error:", err);
+    res.status(500).json({ error: "Failed to delete invoice" });
+  }
+});
+
+payablesRouter.post("/invoices/:id/comments", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  const body = String(req.body.body ?? "").trim();
+  if (!body) return res.status(400).json({ error: "Comment is required" });
+  await connectMongo();
+  const comment = { id: randomUUID(), body, authorUid: actor.uid, authorEmail: actor.email, createdAt: new Date() };
+  const invoice = await Invoice.findOneAndUpdate({ _id: req.params.id, uid: actor.uid }, { $push: { comments: comment } }, { new: true }).lean();
+  if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+  await audit(actor.uid, req.params.id, "comment_added", actor, { body });
+  res.json(sanitizeInvoice(invoice));
+});
+
+payablesRouter.post("/invoices/:id/approve", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const invoice = await Invoice.findOne({ _id: req.params.id, uid: actor.uid });
+    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    if (!ensureCanApprove(actor, invoice, res)) return;
+    (invoice as any).status = "approved";
+    (invoice as any).approvedAt = new Date();
+    (invoice as any).approvedBy = actor.email ?? actor.uid;
+    await invoice.save();
+    await audit(actor.uid, req.params.id, "invoice_approved", actor);
+    await notify(actor.uid, { invoiceId: req.params.id, key: `approved:${req.params.id}`, type: "status", title: "Invoice approved", message: `${(invoice as any).vendor ?? "Invoice"} was approved.`, severity: "success" });
+    const company = await PayablesCompanyProfile.findOne({ uid: actor.uid }).lean() as any;
+    if (company?.autoEmailOnApprove !== false) {
+      setImmediate(() => sendSupplierEmail(actor.uid, invoice, "invoice_approved", { sentBy: actor.email }));
+    }
+    res.json(sanitizeInvoice(invoice));
+  } catch (err) {
+    console.error("Payables approve error:", err);
+    res.status(500).json({ error: "Failed to approve invoice" });
+  }
+});
+
+payablesRouter.post("/invoices/:id/reject", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const invoice = await Invoice.findOne({ _id: req.params.id, uid: actor.uid });
+    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    if (!ensureCanApprove(actor, invoice, res)) return;
+    (invoice as any).status = "rejected";
+    (invoice as any).rejectedAt = new Date();
+    (invoice as any).rejectionReason = req.body.reason ?? "";
+    await invoice.save();
+    await audit(actor.uid, req.params.id, "invoice_rejected", actor, { reason: req.body.reason ?? "" });
+    await notify(actor.uid, { invoiceId: req.params.id, key: `rejected:${req.params.id}`, type: "status", title: "Invoice rejected", message: `${(invoice as any).vendor ?? "Invoice"} was rejected.`, severity: "warning" });
+    const company2 = await PayablesCompanyProfile.findOne({ uid: actor.uid }).lean() as any;
+    if (company2?.autoEmailOnReject !== false) {
+      setImmediate(() => sendSupplierEmail(actor.uid, invoice, "invoice_rejected", { sentBy: actor.email }));
+    }
+    res.json(sanitizeInvoice(invoice));
+  } catch (err) {
+    console.error("Payables reject error:", err);
+    res.status(500).json({ error: "Failed to reject invoice" });
+  }
+});
+
+payablesRouter.post("/invoices/:id/paid", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  try {
+    await connectMongo();
+    const invoice = await Invoice.findOne({ _id: req.params.id, uid: actor.uid });
+    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    (invoice as any).status = "paid";
+    (invoice as any).paidAt = new Date();
+    if (req.body.paymentAmount) (invoice as any).paymentAmount = req.body.paymentAmount;
+    await invoice.save();
+    await audit(actor.uid, req.params.id, "invoice_paid", actor, { paymentAmount: req.body.paymentAmount });
+    await notify(actor.uid, { invoiceId: req.params.id, key: `paid:${req.params.id}`, type: "status", title: "Payment recorded", message: `${(invoice as any).vendor ?? "Invoice"} was marked as paid.`, severity: "success" });
+    res.json(sanitizeInvoice(invoice));
+  } catch {
+    res.status(500).json({ error: "Failed to mark as paid" });
+  }
+});
+
+payablesRouter.post("/invoices/:id/analyze", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const invoice = await Invoice.findOne({ _id: req.params.id, uid: actor.uid });
+    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    await extractAndApplyInvoice(invoice);
+    await analyzeInvoice(req.params.id, actor.uid);
+    await audit(actor.uid, req.params.id, "invoice_analyzed", actor);
+    const updated = await Invoice.findOne({ _id: req.params.id, uid: actor.uid }).lean();
+    res.json(sanitizeInvoice(updated));
+  } catch {
+    res.status(500).json({ error: "Failed to analyze invoice" });
+  }
+});
+
+payablesRouter.post("/invoices/:id/mark-paid", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  try {
+    await connectMongo();
+    const invoice = await Invoice.findOne({ _id: req.params.id, uid: actor.uid });
+    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    (invoice as any).status = "paid";
+    (invoice as any).paidAt = new Date();
+    (invoice as any).paymentAmount = req.body.paymentAmount ?? (invoice as any).total;
+    if (req.body.paidNote) (invoice as any).paidNote = String(req.body.paidNote).trim();
+    await invoice.save();
+    await audit(actor.uid, req.params.id, "invoice_marked_paid", actor, { amount: (invoice as any).paymentAmount, note: (invoice as any).paidNote });
+    await notify(actor.uid, { invoiceId: req.params.id, key: `paid:${req.params.id}`, type: "status", title: "Invoice marked as paid", message: `${(invoice as any).vendor ?? "Invoice"} marked as paid.`, severity: "success" });
+    const emailResult = await sendSupplierEmail(actor.uid, invoice, "payment_confirmed", { sentBy: actor.email });
+    res.json({ invoice: sanitizeInvoice(invoice), emailSent: emailResult.success, emailTo: emailResult.to, emailError: emailResult.error });
+  } catch (err) {
+    console.error("Payables mark-paid error:", err);
+    res.status(500).json({ error: "Failed to mark invoice as paid" });
+  }
+});
+
+payablesRouter.post("/invoices/:id/send-email", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  try {
+    await connectMongo();
+    const invoice = await Invoice.findOne({ _id: req.params.id, uid: actor.uid });
+    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    const type = req.body.type as EmailTemplateType;
+    const validTypes: EmailTemplateType[] = ["invoice_received", "invoice_approved", "invoice_rejected", "invoice_flagged", "payment_confirmed"];
+    if (!validTypes.includes(type)) return res.status(400).json({ error: "Invalid email type" });
+    const overrideTo = req.body.to ? String(req.body.to).trim() : undefined;
+    const result = await sendSupplierEmail(actor.uid, invoice, type, { to: overrideTo, sentBy: actor.email });
+    if (!result.success) return res.status(400).json({ error: result.error });
+    await audit(actor.uid, req.params.id, "supplier_email_sent", actor, { type, to: result.to, subject: result.subject });
+    res.json({ success: true, to: result.to, subject: result.subject });
+  } catch (err) {
+    console.error("Payables send-email error:", err);
+    res.status(500).json({ error: "Failed to send email" });
+  }
+});
+
+payablesRouter.get("/invoices/:id/email-preview", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const invoice = await Invoice.findOne({ _id: req.params.id, uid: actor.uid }).lean() as any;
+    if (!invoice) return res.status(404).json({ error: "Invoice not found" });
+    const type = (req.query.type as EmailTemplateType) || "invoice_approved";
+    const validTypes: EmailTemplateType[] = ["invoice_received", "invoice_approved", "invoice_rejected", "invoice_flagged", "payment_confirmed"];
+    if (!validTypes.includes(type)) return res.status(400).json({ error: "Invalid email type" });
+    const settings = await getEmailSettings(actor.uid);
+    const invData = {
+      invoiceNumber: invoice.invoiceNumber,
+      invoiceDate: invoice.invoiceDate,
+      dueDate: invoice.dueDate,
+      total: invoice.total,
+      currency: invoice.currency,
+      vendor: invoice.vendor,
+      vendorEmail: invoice.vendorEmail,
+      rejectionReason: invoice.rejectionReason,
+      flagMessages: (invoice.flags ?? []).map((f: any) => f.message).filter(Boolean),
+      bankDetails: invoice.bankDetails,
+      paidAt: invoice.paidAt,
+      paidNote: invoice.paidNote,
+    };
+    const html = buildEmailHtml(type, invData, settings);
+    const subject = buildSubjectLine(type, invData, settings);
+    res.json({ html, subject, to: invoice.vendorEmail });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to generate email preview" });
+  }
+});
+
+payablesRouter.get("/payment-queue", async (req, res) => {
+    const actor = await getActor(req, res);
+    if (!actor) return;
+    try {
+      await connectMongo();
+      const invoices = await Invoice.find({ uid: actor.uid, status: { $in: ["approved", "pending_approval", "extracted"] } })
+        .select("-originalFileData")
+        .sort({ dueDate: 1, total: -1 })
+        .lean();
+      const queue = invoices.map((invoice: any) => ({ ...invoice, daysUntilDue: daysFromNow(invoice.dueDate), urgency: paymentUrgency(invoice), discountAlert: earlyPaymentDiscount(invoice) }));
+      const approved = queue.filter((invoice: any) => invoice.status === "approved");
+      const discounts = queue.filter((invoice: any) => invoice.discountAlert);
+      res.json({ queue, summary: { totalQueued: queue.length, approvedReady: approved.length, approvedAmount: summarizeInvoices(approved), discountOpportunities: discounts.length, estimatedSavings: discounts.reduce((sum: number, inv: any) => sum + (inv.discountAlert?.estimatedSavings ?? 0), 0) } });
+    } catch (err) {
+      console.error("Payables payment queue error:", err);
+      res.status(500).json({ error: "Failed to fetch payment queue" });
+    }
+  });
+
+  payablesRouter.get("/cash-forecast", async (req, res) => {
+    const actor = await getActor(req, res);
+    if (!actor) return;
+    try {
+      await connectMongo();
+      const invoices = await Invoice.find({ uid: actor.uid, status: { $nin: ["paid", "rejected"] }, dueDate: { $exists: true, $nin: [null, ""] } })
+        .select("-originalFileData")
+        .lean();
+      const today = startOfDay();
+      const in7 = addDays(today, 7);
+      const in30 = addDays(today, 30);
+      const in60 = addDays(today, 60);
+      const bucket = (from: Date | null, to: Date | null) => invoices.filter((invoice: any) => {
+        const due = new Date(invoice.dueDate);
+        if (from && due < from) return false;
+        if (to && due > to) return false;
+        return true;
+      });
+      const overdue = invoices.filter((invoice: any) => new Date(invoice.dueDate) < today);
+      const thisWeek = bucket(today, in7);
+      const thisMonth = bucket(today, in30);
+      const nextMonth = bucket(addDays(in30, 1), in60);
+      const later = bucket(addDays(in60, 1), null);
+      res.json({
+        generatedAt: new Date().toISOString(),
+        buckets: {
+          overdue: { count: overdue.length, amount: summarizeInvoices(overdue), invoices: overdue },
+          thisWeek: { count: thisWeek.length, amount: summarizeInvoices(thisWeek), invoices: thisWeek },
+          thisMonth: { count: thisMonth.length, amount: summarizeInvoices(thisMonth), invoices: thisMonth },
+          nextMonth: { count: nextMonth.length, amount: summarizeInvoices(nextMonth), invoices: nextMonth },
+          later: { count: later.length, amount: summarizeInvoices(later), invoices: later },
+        },
+      });
+    } catch (err) {
+      console.error("Payables forecast error:", err);
+      res.status(500).json({ error: "Failed to build cash forecast" });
+    }
+  });
+
+  payablesRouter.get("/spend-analytics", async (req, res) => {
+    const actor = await getActor(req, res);
+    if (!actor) return;
+    try {
+      await connectMongo();
+
+      // Build date range filter from period query param
+      const period = String(req.query.period ?? "all");
+      const now = new Date();
+      let dateFrom: Date | null = null;
+      if (period === "30d") { dateFrom = new Date(now); dateFrom.setDate(dateFrom.getDate() - 30); }
+      else if (period === "3m") { dateFrom = new Date(now); dateFrom.setMonth(dateFrom.getMonth() - 3); }
+      else if (period === "6m") { dateFrom = new Date(now); dateFrom.setMonth(dateFrom.getMonth() - 6); }
+      else if (period === "1y") { dateFrom = new Date(now); dateFrom.setFullYear(dateFrom.getFullYear() - 1); }
+      else if (req.query.from) { dateFrom = new Date(String(req.query.from)); }
+
+      const baseMatch: Record<string, any> = { uid: actor.uid };
+      if (dateFrom) baseMatch.createdAt = { $gte: dateFrom };
+
+      const spendMatch = { ...baseMatch, total: { $gt: 0 } };
+
+      const [byVendor, byMonth, byStatus, bySource, topLineItems, growth] = await Promise.all([
+        // Top vendors by spend
+        Invoice.aggregate([
+          { $match: spendMatch },
+          { $group: { _id: "$vendor", vendor: { $first: "$vendor" }, amount: { $sum: "$total" }, count: { $sum: 1 }, avgAmount: { $avg: "$total" }, paidCount: { $sum: { $cond: [{ $eq: ["$status", "paid"] }, 1, 0] } } } },
+          { $sort: { amount: -1 } },
+          { $limit: 15 },
+        ]),
+        // Monthly spend trend
+        Invoice.aggregate([
+          { $match: spendMatch },
+          { $group: { _id: { $substr: ["$invoiceDate", 0, 7] }, month: { $first: { $substr: ["$invoiceDate", 0, 7] } }, amount: { $sum: "$total" }, count: { $sum: 1 } } },
+          { $sort: { _id: 1 } },
+        ]),
+        // Status breakdown
+        Invoice.aggregate([
+          { $match: { ...baseMatch } },
+          { $group: { _id: "$status", amount: { $sum: { $ifNull: ["$total", 0] } }, count: { $sum: 1 } } },
+          { $sort: { count: -1 } },
+        ]),
+        // Source breakdown (upload vs gmail vs supplier_link)
+        Invoice.aggregate([
+          { $match: spendMatch },
+          { $group: { _id: "$source", amount: { $sum: "$total" }, count: { $sum: 1 } } },
+          { $sort: { amount: -1 } },
+        ]),
+        // Top line item descriptions (category proxy)
+        Invoice.aggregate([
+          { $match: spendMatch },
+          { $unwind: { path: "$lineItems", preserveNullAndEmptyArrays: false } },
+          { $match: { "lineItems.description": { $exists: true, $nin: [null, ""] }, "lineItems.amount": { $gt: 0 } } },
+          { $group: { _id: "$lineItems.description", amount: { $sum: "$lineItems.amount" }, count: { $sum: 1 } } },
+          { $sort: { amount: -1 } },
+          { $limit: 10 },
+        ]),
+        // Month-over-month growth: last 2 full months
+        Invoice.aggregate([
+          { $match: { uid: actor.uid, total: { $gt: 0 } } },
+          { $group: { _id: { $substr: ["$invoiceDate", 0, 7] }, amount: { $sum: "$total" } } },
+          { $sort: { _id: -1 } },
+          { $limit: 2 },
+        ]),
+      ]);
+
+      // Calculate MoM growth
+      let momGrowth: number | null = null;
+      if (growth.length === 2) {
+        const [latest, prev] = growth;
+        if (prev.amount > 0) momGrowth = ((latest.amount - prev.amount) / prev.amount) * 100;
+      }
+
+      // Summary totals
+      const allInvoices = await Invoice.aggregate([
+        { $match: spendMatch },
+        { $group: { _id: null, total: { $sum: "$total" }, count: { $sum: 1 }, avgAmount: { $avg: "$total" } } },
+      ]);
+      const summary = allInvoices[0] ?? { total: 0, count: 0, avgAmount: 0 };
+
+      res.json({ byVendor, byMonth, byStatus, bySource, topLineItems, momGrowth, summary });
+    } catch (err) {
+      console.error("Payables analytics error:", err);
+      res.status(500).json({ error: "Failed to fetch spend analytics" });
+    }
+  });
+
+  payablesRouter.get("/accounting/status", async (req, res) => {
+    const actor = await getActor(req, res);
+    if (!actor) return;
+    await connectMongo();
+    const records = await PayablesAccountingConnection.find({ uid: actor.uid }).lean();
+    const providers = ["quickbooks", "xero"].map((provider) => records.find((record: any) => record.provider === provider) ?? { provider, status: "not_connected" });
+    res.json({ providers });
+  });
+
+  payablesRouter.post("/accounting/connect", async (req, res) => {
+    const actor = await getActor(req, res);
+    if (!actor) return;
+    if (!ensureManageWorkspace(actor, res)) return;
+    const provider = String(req.body.provider ?? "").toLowerCase();
+    if (!["quickbooks", "xero"].includes(provider)) return res.status(400).json({ error: "Provider must be quickbooks or xero" });
+    await connectMongo();
+    const hasOAuthConfig = provider === "quickbooks" ? !!(process.env.QUICKBOOKS_CLIENT_ID && process.env.QUICKBOOKS_CLIENT_SECRET) : !!(process.env.XERO_CLIENT_ID && process.env.XERO_CLIENT_SECRET);
+    const connection = await PayablesAccountingConnection.findOneAndUpdate(
+      { uid: actor.uid, provider },
+      { uid: actor.uid, provider, status: hasOAuthConfig ? "connected" : "export_ready", externalCompanyName: String(req.body.externalCompanyName ?? "").trim(), settings: { configuredBy: actor.email ?? actor.actorUid, configuredAt: new Date().toISOString(), mode: hasOAuthConfig ? "oauth_configured" : "export_ready" } },
+      { upsert: true, new: true }
+    );
+    await audit(actor.uid, undefined, "accounting_connection_updated", actor, { provider, status: (connection as any).status });
+    res.json({ connection, oauthConfigured: hasOAuthConfig });
+  });
+
+  payablesRouter.post("/accounting/sync", async (req, res) => {
+    const actor = await getActor(req, res);
+    if (!actor) return;
+    if (!ensureManageWorkspace(actor, res)) return;
+    const provider = String(req.body.provider ?? "").toLowerCase();
+    if (!["quickbooks", "xero"].includes(provider)) return res.status(400).json({ error: "Provider must be quickbooks or xero" });
+    await connectMongo();
+    const invoices = await Invoice.find({ uid: actor.uid, status: { $in: ["approved", "paid"] } }).select("-originalFileData").lean();
+    const connection = await PayablesAccountingConnection.findOneAndUpdate(
+      { uid: actor.uid, provider },
+      { uid: actor.uid, provider, status: "export_ready", lastSyncAt: new Date(), lastSyncCount: invoices.length, lastSyncMode: "export_ready" },
+      { upsert: true, new: true }
+    );
+    await audit(actor.uid, undefined, "accounting_sync_prepared", actor, { provider, invoiceCount: invoices.length });
+    res.json({ success: true, provider, mode: (connection as any).lastSyncMode, syncedCount: invoices.length, invoices });
+  });
+
+  payablesRouter.get("/reports/summary.csv", async (req, res) => {
+    const actor = await getActor(req, res);
+    if (!actor) return;
+    await connectMongo();
+    const invoices = await Invoice.find({ uid: actor.uid }).select("-originalFileData").sort({ dueDate: 1 }).lean();
+    const rows = [["Vendor", "Invoice Number", "Status", "Due Date", "Currency", "Total", "Source"], ...invoices.map((invoice: any) => [invoice.vendor, invoice.invoiceNumber, invoice.status, invoice.dueDate, invoice.currency, invoice.total, invoice.source])];
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", "attachment; filename=payables-report.csv");
+    res.send(rows.map((row) => row.map(csvEscape).join(",")).join("\n"));
+  });
+
+  payablesRouter.get("/reports/summary", async (req, res) => {
+    const actor = await getActor(req, res);
+    if (!actor) return;
+    await connectMongo();
+    const invoices = await Invoice.find({ uid: actor.uid }).select("-originalFileData").sort({ dueDate: 1 }).lean();
+    res.json({ invoices, totals: { count: invoices.length, amount: summarizeInvoices(invoices as any[]) } });
+  });
+  
+payablesRouter.get("/vendors", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const vendors = await Invoice.aggregate([
+      { $match: { uid: actor.uid, vendor: { $exists: true, $nin: [null, ""] } } },
+      {
+        $group: {
+          _id: "$vendor",
+          vendor: { $first: "$vendor" },
+          vendorEmail: { $first: "$vendorEmail" },
+          invoiceCount: { $sum: 1 },
+          totalSpend: { $sum: { $ifNull: ["$total", 0] } },
+          avgInvoice: { $avg: { $ifNull: ["$total", 0] } },
+          lastInvoiceDate: { $max: "$createdAt" },
+          approvedCount: { $sum: { $cond: [{ $eq: ["$status", "approved"] }, 1, 0] } },
+          paidCount: { $sum: { $cond: [{ $eq: ["$status", "paid"] }, 1, 0] } },
+          pendingCount: { $sum: { $cond: [{ $in: ["$status", ["extracted", "pending_approval"]] }, 1, 0] } },
+          currencies: { $addToSet: "$currency" },
+          isNewVendor: { $first: "$isNewVendor" },
+        },
+      },
+      { $sort: { totalSpend: -1 } },
+    ]);
+    res.json({ vendors });
+  } catch (err) {
+    console.error("Payables vendors error:", err);
+    res.status(500).json({ error: "Failed to fetch vendors" });
+  }
+});
+
+payablesRouter.get("/vendors/:vendorName/invoices", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const vendorName = decodeURIComponent(req.params.vendorName);
+    const invoices = await Invoice.find({ uid: actor.uid, vendor: vendorName }).select("-originalFileData").sort({ createdAt: -1 }).lean();
+    res.json({ invoices });
+  } catch {
+    res.status(500).json({ error: "Failed to fetch vendor invoices" });
+  }
+});
+
+/* Supplier history — fuzzy name match OR exact email match + aggregated stats */
+payablesRouter.get("/supplier-history", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const { name, email } = req.query as { name?: string; email?: string };
+    if (!name && !email) return res.status(400).json({ error: "name or email required" });
+
+    const orClauses: Record<string, unknown>[] = [];
+    if (name && name.trim()) {
+      orClauses.push({ vendor: new RegExp(name.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") });
+    }
+    if (email && email.trim()) {
+      orClauses.push({ vendorEmail: email.trim().toLowerCase() });
+    }
+
+    const invoices = await Invoice.find({ uid: actor.uid, $or: orClauses })
+      .select("-originalFileData")
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const totalSpend = invoices.reduce((s: number, inv: any) => s + (inv.total ?? 0), 0);
+    const statusCounts: Record<string, number> = {};
+    for (const inv of invoices) {
+      const st = (inv as any).status ?? "unknown";
+      statusCounts[st] = (statusCounts[st] ?? 0) + 1;
+    }
+    const avgInvoice = invoices.length > 0 ? totalSpend / invoices.length : 0;
+    const latestInvoice = invoices[0] as any;
+    const currencies = [...new Set(invoices.map((i: any) => i.currency).filter(Boolean))];
+
+    res.json({
+      invoices,
+      stats: {
+        totalInvoices: invoices.length,
+        totalSpend,
+        avgInvoice,
+        statusCounts,
+        currencies,
+        latestDate: latestInvoice?.invoiceDate ?? latestInvoice?.createdAt,
+        latestInvoiceNumber: latestInvoice?.invoiceNumber,
+      },
+    });
+  } catch {
+    res.status(500).json({ error: "Failed to fetch supplier history" });
+  }
+});
+
+payablesRouter.get("/gmail/status", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const token = await InboxToken.findOne({ uid: actor.uid });
+    res.json({ connected: !!token, email: token ? (token as any).email : null });
+  } catch {
+    res.json({ connected: false, email: null });
+  }
+});
+
+/* ──────────────────────────────────────────────────────────────────────────────
+   EMAIL INBOX DASHBOARD — scan, fetch-one, fetch-all (sequential), delete
+   ────────────────────────────────────────────────────────────────────────────── */
+
+const GmailEmailSchema = new Schema(
+  {
+    uid: { type: String, required: true, index: true },
+    gmailMessageId: { type: String, required: true, index: true },
+    subject: String,
+    from: String,
+    fromEmail: String,
+    snippet: String,
+    receivedAt: Date,
+    hasAttachment: { type: Boolean, default: false },
+    attachmentName: String,
+    attachmentMime: String,
+    status: {
+      type: String,
+      enum: ["pending", "processing", "completed", "failed"],
+      default: "pending",
+    },
+    invoiceId: String,
+    processedAt: Date,
+    errorMessage: String,
+  },
+  { timestamps: true }
+);
+
+GmailEmailSchema.index({ uid: 1, gmailMessageId: 1 }, { unique: true });
+
+const GmailEmail =
+  mongoose.models.GmailEmail ||
+  mongoose.model("GmailEmail", GmailEmailSchema);
+
+function parseEmailAddress(raw: string): { name: string; email: string } {
+  const match = raw.match(/^(.*?)\s*<([^>]+)>$/);
+  if (match) return { name: match[1].trim().replace(/^["']|["']$/g, ""), email: match[2].trim() };
+  return { name: raw.trim(), email: raw.trim() };
+}
+
+function isInvoiceEmail(subject: string, snippet: string): boolean {
+  const combined = `${subject} ${snippet}`.toLowerCase();
+  const keywords = ["invoice", "bill", "payment due", "receipt", "proforma", "purchase order", "statement", "overdue", "amount due", "tax invoice", "credit note", "debit note", "quotation", "payable"];
+  return keywords.some((k) => combined.includes(k));
+}
+
+const autoScanLastRun = new Map<string, Date>();
+
+async function scanGmailInboxForUser(uid: string): Promise<{ discovered: number; skipped: number }> {
+  await connectMongo();
+  let auth: Awaited<ReturnType<typeof getGmailClient>>;
+  try {
+    auth = await getGmailClient(uid);
+  } catch {
+    return { discovered: 0, skipped: 0 };
+  }
+
+  const gmail = google.gmail({ version: "v1", auth });
+  let listRes: any;
+  try {
+    listRes = await gmail.users.messages.list({ userId: "me", q: "-in:sent newer_than:60d", maxResults: 50 });
+  } catch {
+    return { discovered: 0, skipped: 0 };
+  }
+
+  const messages = listRes.data.messages ?? [];
+  let discovered = 0;
+  let skipped = 0;
+
+  for (const msg of messages) {
+    if (!msg.id) continue;
+    const existing = await GmailEmail.findOne({ uid, gmailMessageId: msg.id }).lean();
+    if (existing) { skipped++; continue; }
+
+    try {
+      const full = await gmail.users.messages.get({ userId: "me", id: msg.id, format: "metadata", metadataHeaders: ["Subject", "From", "Date"] });
+      const payload = full.data.payload;
+      const headers = payload?.headers ?? [];
+      const subject = headers.find((h: any) => h.name === "Subject")?.value ?? "";
+      const fromRaw = headers.find((h: any) => h.name === "From")?.value ?? "";
+      const dateHeader = headers.find((h: any) => h.name === "Date")?.value;
+      const snippet = full.data.snippet ?? "";
+
+      if (!isInvoiceEmail(subject, snippet)) { skipped++; continue; }
+
+      const { name: fromName, email: fromEmail } = parseEmailAddress(fromRaw);
+      const receivedAt = dateHeader ? new Date(dateHeader) : new Date(Number(full.data.internalDate));
+
+      const parts = collectParts(payload);
+      const attachmentPart = parts.find((p: any) => ["application/pdf", "image/jpeg", "image/png", "image/webp"].includes(p.mimeType) && (p.body?.attachmentId || p.body?.data));
+      const hasAttachment = !!attachmentPart;
+      const attachmentName = attachmentPart?.filename || "";
+      const attachmentMime = attachmentPart?.mimeType || "";
+
+      await GmailEmail.create({ uid, gmailMessageId: msg.id, subject, from: fromName || fromEmail, fromEmail, snippet, receivedAt, hasAttachment, attachmentName, attachmentMime, status: "pending" });
+      discovered++;
+    } catch {
+      skipped++;
+    }
+  }
+
+  autoScanLastRun.set(uid, new Date());
+  return { discovered, skipped };
+}
+
+export async function startPayablesAutoScan(intervalMs = 2 * 60 * 60 * 1000) {
+  await connectMongo();
+  const runScan = async () => {
+    try {
+      const tokens = await InboxToken.find({}).select("uid").lean();
+      for (const t of tokens) {
+        const uid = (t as any).uid;
+        if (!uid) continue;
+        const profile = await PayablesCompanyProfile.findOne({ uid }).lean();
+        if (!profile) continue;
+        try {
+          const { discovered } = await scanGmailInboxForUser(uid);
+          if (discovered > 0) console.log(`[payables-autoscan] uid=${uid} discovered=${discovered} new invoice emails`);
+        } catch (err) {
+          console.warn(`[payables-autoscan] uid=${uid} error:`, err instanceof Error ? err.message : err);
+        }
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    } catch (err) {
+      console.warn("[payables-autoscan] scan error:", err instanceof Error ? err.message : err);
+    }
+  };
+
+  setTimeout(runScan, 30_000);
+  setInterval(runScan, intervalMs);
+  console.log(`[payables-autoscan] Auto-scan started — runs every ${Math.round(intervalMs / 60000)} minutes`);
+}
+
+payablesRouter.get("/email-inbox", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const search = (req.query.search as string) || "";
+    const statusFilter = (req.query.status as string) || "all";
+    const query: Record<string, unknown> = { uid: actor.uid };
+    if (statusFilter !== "all") query.status = statusFilter;
+    if (search) {
+      query.$or = [
+        { subject: { $regex: search, $options: "i" } },
+        { from: { $regex: search, $options: "i" } },
+        { fromEmail: { $regex: search, $options: "i" } },
+        { snippet: { $regex: search, $options: "i" } },
+      ];
+    }
+    const emails = await GmailEmail.find(query).sort({ receivedAt: -1 }).limit(100).lean();
+    const total = await GmailEmail.countDocuments({ uid: actor.uid });
+    const pending = await GmailEmail.countDocuments({ uid: actor.uid, status: "pending" });
+    const processing = await GmailEmail.countDocuments({ uid: actor.uid, status: "processing" });
+    const completed = await GmailEmail.countDocuments({ uid: actor.uid, status: "completed" });
+    const lastAutoScan = autoScanLastRun.get(actor.uid) ?? null;
+    res.json({ emails, stats: { total, pending, processing, completed }, lastAutoScan });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to load email inbox" });
+  }
+});
+
+payablesRouter.post("/email-inbox/scan", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  try {
+    const token = await InboxToken.findOne({ uid: actor.uid }).lean();
+    if (!token) return res.status(400).json({ error: "Gmail not connected. Please connect your Gmail in the Payables setup." });
+    const { discovered, skipped } = await scanGmailInboxForUser(actor.uid);
+    res.json({ success: true, discovered, skipped, message: `Scan complete. Found ${discovered} new invoice email${discovered !== 1 ? "s" : ""}.` });
+  } catch (err) {
+    console.error("[payables] email-inbox scan error:", err);
+    res.status(500).json({ error: "Failed to scan Gmail inbox" });
+  }
+});
+
+payablesRouter.post("/email-inbox/:emailId/process", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  try {
+    await connectMongo();
+    const emailDoc = await GmailEmail.findOne({ _id: req.params.emailId, uid: actor.uid });
+    if (!emailDoc) return res.status(404).json({ error: "Email not found" });
+    if ((emailDoc as any).status === "processing") return res.status(400).json({ error: "This email is already being processed" });
+    if ((emailDoc as any).status === "completed") return res.status(400).json({ error: "This email has already been processed" });
+
+    (emailDoc as any).status = "processing";
+    await emailDoc.save();
+
+    setImmediate(async () => {
+      try {
+        let auth: Awaited<ReturnType<typeof getGmailClient>>;
+        try { auth = await getGmailClient(actor.uid); } catch { (emailDoc as any).status = "failed"; (emailDoc as any).errorMessage = "Gmail not connected"; await emailDoc.save(); return; }
+        const gmail = google.gmail({ version: "v1", auth });
+        const full = await gmail.users.messages.get({ userId: "me", id: (emailDoc as any).gmailMessageId, format: "full" });
+        const payload = full.data.payload;
+        if (!payload) { (emailDoc as any).status = "failed"; (emailDoc as any).errorMessage = "Could not retrieve email content"; await emailDoc.save(); return; }
+        const headers = payload.headers ?? [];
+        const subject = headers.find((h) => h.name === "Subject")?.value ?? "";
+        const from = headers.find((h) => h.name === "From")?.value ?? "";
+        const parts = collectParts(payload);
+        let bodyText = "";
+        for (const part of parts) if (part.mimeType === "text/plain" && part.body?.data) bodyText += decodeGmailData(part.body.data);
+        if (!bodyText && payload.body?.data) bodyText = decodeGmailData(payload.body.data);
+
+        let attachmentData = "";
+        let attachmentMime = "";
+        let attachmentName = "";
+        const attachmentPart = parts.find((p: any) => ["application/pdf", "image/jpeg", "image/png", "image/webp"].includes(p.mimeType) && (p.body?.attachmentId || p.body?.data));
+        if (attachmentPart) {
+          attachmentMime = attachmentPart.mimeType;
+          attachmentName = attachmentPart.filename || subject || "gmail-invoice";
+          if (attachmentPart.body?.data) attachmentData = attachmentPart.body.data.replace(/-/g, "+").replace(/_/g, "/");
+          else if (attachmentPart.body?.attachmentId) {
+            const att = await gmail.users.messages.attachments.get({ userId: "me", messageId: (emailDoc as any).gmailMessageId, id: attachmentPart.body.attachmentId });
+            attachmentData = (att.data.data ?? "").replace(/-/g, "+").replace(/_/g, "/");
+          }
+        }
+
+        const rawText = `Subject: ${subject}\nFrom: ${from}\n\n${bodyText}`;
+        const existingInvoice = await Invoice.findOne({ uid: actor.uid, gmailMessageId: (emailDoc as any).gmailMessageId });
+        let invoice = existingInvoice as any;
+        if (!invoice) {
+          invoice = new Invoice({ uid: actor.uid, source: "gmail", status: "processing", gmailMessageId: (emailDoc as any).gmailMessageId, rawText, originalFileName: attachmentName || subject || "Gmail invoice", originalMimeType: attachmentMime || undefined, originalFileData: attachmentData || undefined }) as any;
+          await invoice.save();
+          await audit(actor.uid, invoice._id.toString(), "gmail_invoice_imported", actor, { subject, from });
+          await notify(actor.uid, { invoiceId: invoice._id.toString(), key: `new:${invoice._id.toString()}`, type: "new_invoice", title: "New Gmail invoice imported", message: `${subject || "A Gmail invoice"} was imported from ${from || "Gmail"} and AI extraction has started.`, severity: "info" });
+        }
+
+        await extractAndApplyInvoice(invoice);
+        await analyzeInvoice(invoice._id.toString(), actor.uid);
+
+        (emailDoc as any).status = "completed";
+        (emailDoc as any).invoiceId = invoice._id.toString();
+        (emailDoc as any).processedAt = new Date();
+        await emailDoc.save();
+      } catch (err: any) {
+        (emailDoc as any).status = "failed";
+        (emailDoc as any).errorMessage = err?.message || "Processing failed";
+        await emailDoc.save();
+      }
+    });
+
+    res.json({ success: true, message: "Processing started" });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to start processing" });
+  }
+});
+
+payablesRouter.post("/email-inbox/process-all", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  try {
+    await connectMongo();
+    const pendingEmails = await GmailEmail.find({ uid: actor.uid, status: "pending" }).sort({ receivedAt: 1 }).lean();
+    if (!pendingEmails.length) return res.json({ success: true, queued: 0, message: "No pending emails to process" });
+
+    const ids = pendingEmails.map((e: any) => e._id.toString());
+    await GmailEmail.updateMany({ _id: { $in: ids } }, { $set: { status: "processing" } });
+
+    setImmediate(async () => {
+      for (const emailMeta of pendingEmails) {
+        const emailDoc = await GmailEmail.findOne({ _id: (emailMeta as any)._id, uid: actor.uid });
+        if (!emailDoc) continue;
+        try {
+          let auth: Awaited<ReturnType<typeof getGmailClient>>;
+          try { auth = await getGmailClient(actor.uid); } catch { (emailDoc as any).status = "failed"; (emailDoc as any).errorMessage = "Gmail not connected"; await emailDoc.save(); continue; }
+          const gmail = google.gmail({ version: "v1", auth });
+          const full = await gmail.users.messages.get({ userId: "me", id: (emailDoc as any).gmailMessageId, format: "full" });
+          const payload = full.data.payload;
+          if (!payload) { (emailDoc as any).status = "failed"; (emailDoc as any).errorMessage = "Could not retrieve email content"; await emailDoc.save(); continue; }
+          const headers = payload.headers ?? [];
+          const subject = headers.find((h) => h.name === "Subject")?.value ?? "";
+          const from = headers.find((h) => h.name === "From")?.value ?? "";
+          const parts = collectParts(payload);
+          let bodyText = "";
+          for (const part of parts) if (part.mimeType === "text/plain" && part.body?.data) bodyText += decodeGmailData(part.body.data);
+          if (!bodyText && payload.body?.data) bodyText = decodeGmailData(payload.body.data);
+
+          let attachmentData = "";
+          let attachmentMime = "";
+          let attachmentName = "";
+          const attachmentPart = parts.find((p: any) => ["application/pdf", "image/jpeg", "image/png", "image/webp"].includes(p.mimeType) && (p.body?.attachmentId || p.body?.data));
+          if (attachmentPart) {
+            attachmentMime = attachmentPart.mimeType;
+            attachmentName = attachmentPart.filename || subject || "gmail-invoice";
+            if (attachmentPart.body?.data) attachmentData = attachmentPart.body.data.replace(/-/g, "+").replace(/_/g, "/");
+            else if (attachmentPart.body?.attachmentId) {
+              const att = await gmail.users.messages.attachments.get({ userId: "me", messageId: (emailDoc as any).gmailMessageId, id: attachmentPart.body.attachmentId });
+              attachmentData = (att.data.data ?? "").replace(/-/g, "+").replace(/_/g, "/");
+            }
+          }
+
+          const rawText = `Subject: ${subject}\nFrom: ${from}\n\n${bodyText}`;
+          const existingInvoice = await Invoice.findOne({ uid: actor.uid, gmailMessageId: (emailDoc as any).gmailMessageId });
+          let invoice = existingInvoice as any;
+          if (!invoice) {
+            invoice = new Invoice({ uid: actor.uid, source: "gmail", status: "processing", gmailMessageId: (emailDoc as any).gmailMessageId, rawText, originalFileName: attachmentName || subject || "Gmail invoice", originalMimeType: attachmentMime || undefined, originalFileData: attachmentData || undefined }) as any;
+            await invoice.save();
+            await audit(actor.uid, invoice._id.toString(), "gmail_invoice_imported", actor, { subject, from });
+          }
+
+          await extractAndApplyInvoice(invoice);
+          await analyzeInvoice(invoice._id.toString(), actor.uid);
+
+          (emailDoc as any).status = "completed";
+          (emailDoc as any).invoiceId = invoice._id.toString();
+          (emailDoc as any).processedAt = new Date();
+          await emailDoc.save();
+
+          await new Promise((r) => setTimeout(r, 1500));
+        } catch (err: any) {
+          (emailDoc as any).status = "failed";
+          (emailDoc as any).errorMessage = err?.message || "Processing failed";
+          await emailDoc.save();
+        }
+      }
+    });
+
+    res.json({ success: true, queued: pendingEmails.length, message: `Started processing ${pendingEmails.length} email${pendingEmails.length !== 1 ? "s" : ""} one by one` });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to start batch processing" });
+  }
+});
+
+payablesRouter.delete("/email-inbox/:emailId", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  if (!ensureManageWorkspace(actor, res)) return;
+  try {
+    await connectMongo();
+    const result = await GmailEmail.deleteOne({ _id: req.params.emailId, uid: actor.uid });
+    if (!result.deletedCount) return res.status(404).json({ error: "Email not found" });
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ error: "Failed to delete email" });
+  }
+});
+
+/* ─── API Access Request (public, no auth) ─── */
+payablesPublicRouter.post("/api-access-request", async (req, res) => {
+  try {
+    const {
+      fullName, companyName, email, website,
+      useCase, integrationType, monthlyVolume, techStack,
+    } = req.body as Record<string, string>;
+
+    // Basic validation
+    if (!fullName || !email || !useCase) {
+      return res.status(400).json({ error: "Full name, email, and use case are required." });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: "Invalid email address." });
+    }
+
+    // Store in DB
+    await connectMongo();
+    const ApiAccessRequest = mongoose.models.ApiAccessRequest || mongoose.model(
+      "ApiAccessRequest",
+      new Schema({
+        fullName: String, companyName: String, email: String,
+        website: String, useCase: String, integrationType: String,
+        monthlyVolume: String, techStack: String,
+        status: { type: String, default: "pending" },
+        submittedAt: { type: Date, default: Date.now },
+      })
+    );
+    await ApiAccessRequest.create({ fullName, companyName, email, website, useCase, integrationType, monthlyVolume, techStack });
+
+    // Send email via SMTP
+    const smtpUser = process.env.SMTP_USER ?? "";
+    const smtpPass = process.env.SMTP_PASS ?? "";
+    const smtpHost = process.env.SMTP_HOST ?? "smtp.gmail.com";
+    const ownerEmail = process.env.OWNER_EMAIL ?? smtpUser;
+
+    if (smtpUser && smtpPass) {
+      const nodemailer = await import("nodemailer");
+      const transporter = nodemailer.createTransport({
+        host: smtpHost,
+        port: 465,
+        secure: true,
+        auth: { user: smtpUser, pass: smtpPass },
+      });
+
+      const submittedAt = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "full", timeStyle: "short" });
+
+      const html = `
+<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+  body{font-family:'Segoe UI',Arial,sans-serif;background:#f7f8fc;margin:0;padding:0;color:#1d2226;}
+  .wrap{max-width:600px;margin:32px auto;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.07);}
+  .header{background:linear-gradient(135deg,#7c3aed,#4f46e5);padding:32px 32px 24px;color:#fff;}
+  .header h1{margin:0 0 4px;font-size:20px;font-weight:800;}
+  .header p{margin:0;opacity:0.85;font-size:13px;}
+  .badge{display:inline-block;background:rgba(255,255,255,0.2);border-radius:20px;padding:3px 12px;font-size:11px;font-weight:700;letter-spacing:0.06em;margin-bottom:12px;}
+  .body{padding:28px 32px;}
+  .field{margin-bottom:18px;}
+  .label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#7c3aed;margin-bottom:4px;}
+  .value{font-size:15px;font-weight:600;color:#1d2226;background:#f7f8fc;border-radius:8px;padding:10px 14px;border:1px solid #e9eaf0;}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+  .footer{background:#f7f8fc;padding:18px 32px;font-size:12px;color:#9ca3af;border-top:1px solid #e9eaf0;}
+  .action-row{margin-top:24px;display:flex;gap:12px;}
+  .btn{display:inline-block;padding:10px 22px;border-radius:50px;font-size:13px;font-weight:700;text-decoration:none;}
+  .btn-approve{background:linear-gradient(135deg,#7c3aed,#4f46e5);color:#fff;}
+  .btn-deny{background:#fff;color:#64748b;border:1px solid #e2e8f0;}
+</style></head><body>
+<div class="wrap">
+  <div class="header">
+    <div class="badge">NEW API ACCESS REQUEST</div>
+    <h1>Developer API Access Request</h1>
+    <p>Submitted on ${submittedAt} (IST)</p>
+  </div>
+  <div class="body">
+    <div class="grid">
+      <div class="field"><div class="label">Full Name</div><div class="value">${fullName}</div></div>
+      <div class="field"><div class="label">Email</div><div class="value">${email}</div></div>
+      <div class="field"><div class="label">Company</div><div class="value">${companyName || "—"}</div></div>
+      <div class="field"><div class="label">Website</div><div class="value">${website || "—"}</div></div>
+      <div class="field"><div class="label">Integration Type</div><div class="value">${integrationType || "—"}</div></div>
+      <div class="field"><div class="label">Monthly Invoice Volume</div><div class="value">${monthlyVolume || "—"}</div></div>
+    </div>
+    <div class="field"><div class="label">Tech Stack / Languages</div><div class="value">${techStack || "—"}</div></div>
+    <div class="field"><div class="label">Use Case / What are you building?</div><div class="value" style="white-space:pre-wrap">${useCase}</div></div>
+    <div class="action-row">
+      <a class="btn btn-approve" href="mailto:${email}?subject=Your Plyndrox API Access Request — Approved&body=Hi ${encodeURIComponent(fullName)},%0A%0AGreat news! Your API access request has been approved.%0A%0AWe will be in touch shortly with your API credentials and documentation.%0A%0AThank you for choosing Plyndrox.%0A%0ABest regards,">Approve & Reply</a>
+      <a class="btn btn-deny" href="mailto:${email}?subject=Your Plyndrox API Access Request — Update&body=Hi ${encodeURIComponent(fullName)},%0A%0AThank you for your interest in the Plyndrox API.%0A%0A">Reply to Applicant</a>
+    </div>
+  </div>
+  <div class="footer">This request was submitted via plyndrox.app · Plyndrox Developer Platform</div>
+</div>
+</body></html>`;
+
+      await transporter.sendMail({
+        from: `"Plyndrox API Gateway" <${smtpUser}>`,
+        to: ownerEmail,
+        subject: `[API Access Request] ${fullName}${companyName ? ` · ${companyName}` : ""} — ${email}`,
+        html,
+        replyTo: email,
+      });
+    }
+
+    res.json({ success: true, message: "Your request has been submitted. We will review it and reach out to you within 1–2 business days." });
+  } catch (err) {
+    console.error("API access request error:", err);
+    res.status(500).json({ error: "Failed to submit request. Please try again." });
+  }
+});
+
+payablesRouter.get("/flags", async (req, res) => {
+  const actor = await getActor(req, res);
+  if (!actor) return;
+  try {
+    await connectMongo();
+    const flagged = await Invoice.find({ uid: actor.uid, "flags.0": { $exists: true }, status: { $nin: ["rejected", "paid"] } })
+      .sort({ createdAt: -1 })
+      .select("vendor invoiceNumber total currency status flags dueDate createdAt")
+      .lean();
+    res.json({ flagged });
+  } catch {
+    res.status(500).json({ error: "Failed to fetch flags" });
+  }
+});
